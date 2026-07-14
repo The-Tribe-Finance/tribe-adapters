@@ -1,32 +1,29 @@
-# Security Policy
+# Security
 
-## ⚠️ Trạng thái: CHƯA AUDIT
+## Status: pre-audit
 
-Code trong repo này **chưa qua audit chuyên nghiệp**.
+This code has **not been audited**. It is not suitable for real funds.
 
-Test xanh chỉ chứng minh code làm đúng những gì **đã được nghĩ ra để kiểm tra**. Nó
-**không** chứng minh không có lỗ hổng chưa ai nghĩ tới.
+`mock-dex` is a test fixture, designed to misbehave so that the vault's checks can be
+shown to catch it. It is not a production program and must never be deployed.
 
-**Đừng đưa tiền thật vào trước khi có audit.**
+## Adapter trust levels
 
-## Những thứ đang hở (biết trước, chưa đóng)
+**Action adapters** produce results the vault verifies independently. They are treated as
+untrusted; a fault produces a rejected transaction rather than a loss.
 
-| | |
-|---|---|
-| **Upgrade authority** chưa khoá về governance | *Backdoor thật sự — hở nó thì mọi guardrail khác vô nghĩa* |
-| **Governance chưa có** — `admin` là một keypair nắm toàn quyền | whitelist adapter/asset, pause, đổi executor |
-| **Pricing adapter chưa có** | NAV gặp lend/stake position sẽ fail thẳng (cố ý) |
+**Pricing adapters** feed values directly into NAV, where there is nothing to verify them
+against. They are trusted, and must be audited to the same standard as the core vault, and
+deployed immutably.
 
-`mock-dex` là program **test**, cho phép rút token tuỳ ý theo thiết kế.
-**Không bao giờ deploy nó.**
+## Reporting a vulnerability
 
-## Báo lỗi bảo mật
+Please do not open a public issue.
 
-Tìm thấy lỗ hổng? **Đừng mở public issue.**
+Report privately through [GitHub Security Advisories](../../security/advisories/new).
 
-Dùng [GitHub Security Advisory](../../security/advisories/new) để báo riêng.
+Include, where possible:
 
-Xin nêu rõ:
-- Đường tấn công cụ thể (ai làm gì, theo thứ tự nào)
-- Tác động (mất tiền? đóng băng? pha loãng?)
-- Nếu có thể: một test tái hiện được
+- The steps that lead to the issue
+- The impact — loss of funds, denial of service, incorrect accounting
+- A reproduction, if you have one

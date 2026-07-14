@@ -26,3 +26,8 @@ skills-lock.json
 
 # Surfpool local state cache — mainnet fork data, not source
 .surfpool/
+
+# Internal design docs — working notes, not published
+ARCHITECTURE.md
+SPEC.md
+DESIGN-*.md
