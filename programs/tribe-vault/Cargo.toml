@@ -1,0 +1,24 @@
+[package]
+name = "tribe-vault"
+version = "0.1.0"
+description = "The Tribe — community vault: deposits, redemptions, NAV, shares"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "tribe_vault"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+pyth-solana-receiver-sdk = "0.6.1"
+
