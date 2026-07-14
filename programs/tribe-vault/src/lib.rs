@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{
     self, Mint, TokenAccount, TokenInterface, TransferChecked,
 };
@@ -18,31 +19,32 @@ use math::{pro_rata_amount, shares_for_deposit};
 use nav::{add_reserved, available_balances, compute_nav};
 use state::*;
 
-declare_id!("rZfFySp7dkDrQMvYAP2AQiodhp2u5gPKnas2539oDKn");
+declare_id!("ESRKS2xBKnuTZWU7qQip2koV7uG742ehB4qbojwtTrZs");
 
 /// # The Tribe — Community Vault
 ///
-/// Vault giữ tiền của cộng đồng. Program này cố tình làm ít việc nhất có thể:
-/// nhận tiền, trả tiền, đếm share, tính NAV. Governance và execution nằm ở
-/// program khác, để chỗ giữ tiền càng ít phải upgrade càng tốt.
+/// The vault holds the community's money. This program deliberately does as
+/// little as possible: take money in, pay money out, count shares, compute NAV.
+/// Governance and execution live in other programs, so that the place holding
+/// the money has to be upgraded as rarely as possible.
 ///
-/// Ba bất biến không bao giờ được phá:
+/// Three invariants that must NEVER be broken:
 ///
-///   1. NAV luôn tính từ TOÀN BỘ asset. Thiếu một cái là fail.
-///   2. Làm tròn luôn nghiêng về vault. Phần lẻ thuộc về người còn nắm share.
-///   3. Redeem không bao giờ bị pause. Tiền người dùng luôn rút được.
+///   1. NAV is always computed from EVERY asset. If even one is missing, fail.
+///   2. Rounding always favors the vault. The dust belongs to whoever still holds shares.
+///   3. Redeem is never pausable. Users can always get their money out.
 #[program]
 pub mod tribe_vault {
     use super::*;
 
-    /// Khởi tạo vault. Chỉ gọi được một lần.
+    /// Initialize the vault. Can only be called once.
     pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
         let vault = &mut ctx.accounts.vault;
 
         vault.admin = ctx.accounts.admin.key();
-        // MVP: admin tự bấm execute. Tầng 3 đổi sang PDA của tribe-governance
-        // bằng `set_executor` — đúng một chỗ phải sửa, đó là lý do tách execution
-        // ra khỏi governance ngay từ đầu.
+        // MVP: the admin presses execute themselves. Tier 3 switches this to the
+        // tribe-governance PDA via `set_executor` — exactly one place to change,
+        // which is why execution was split out from governance from the start.
         vault.executor = ctx.accounts.admin.key();
         vault.treasury = ctx.accounts.treasury.key();
         vault.share_mint = ctx.accounts.share_mint.key();
@@ -58,10 +60,11 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Thêm một tài sản vào whitelist.
+    /// Add an asset to the whitelist.
     ///
-    /// Đây là quyền nguy hiểm: thêm token rác kèm oracle giả là rút sạch vault.
-    /// MVP để admin nắm, sẽ chuyển sang governance khi protocol trưởng thành.
+    /// This is a dangerous power: registering a junk token with a fake oracle is
+    /// enough to drain the vault. In the MVP the admin holds it; it moves to
+    /// governance as the protocol matures.
     pub fn register_asset(
         ctx: Context<RegisterAsset>,
         feed_id: [u8; 32],
@@ -99,8 +102,9 @@ pub mod tribe_vault {
         asset.index = index;
         asset.enabled = true;
         asset.max_exposure_bps = max_exposure_bps;
-        // Chưa hứa gì cho ai. Ghi tường minh thay vì dựa vào việc Anchor zero-fill —
-        // một field kế toán sai giá trị khởi tạo là loại bug rất khó tìm về sau.
+        // Nothing has been promised to anyone yet. Write it explicitly rather than
+        // relying on Anchor's zero-fill — an accounting field with a wrong initial
+        // value is the kind of bug that is very hard to track down later.
         asset.reserved = 0;
         asset.bump = ctx.bumps.asset;
 
@@ -110,35 +114,35 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Bật/tắt pause.
+    /// Turn pause on/off.
     ///
-    /// Chặn deposit và các action VÀO vị thế (buy/lend/stake). KHÔNG chặn redeem,
-    /// và KHÔNG chặn các action THOÁT vị thế (sell/unlend/unstake) — nếu chặn,
-    /// tài sản đã lend vào Kamino sẽ kẹt vĩnh viễn ở đó.
+    /// Blocks deposits and ENTRY actions (buy/lend/stake). It does NOT block redeem,
+    /// and it does NOT block EXIT actions (sell/unlend/unstake) — if it did, assets
+    /// already lent into Kamino would be permanently stuck there.
     pub fn set_paused(ctx: Context<AdminOnly>, paused: bool) -> Result<()> {
         ctx.accounts.vault.paused = paused;
         Ok(())
     }
 
-    /// Chuyển quyền execute sang một địa chỉ khác.
+    /// Hand the execute right over to another address.
     ///
-    /// Đây là cây cầu duy nhất từ MVP sang governance. MVP: executor = admin.
-    /// Tầng 3: gọi lệnh này một lần, trỏ executor vào PDA của tribe-governance —
-    /// từ đó "được phép execute" nghĩa là "proposal đã pass + hết timelock 24h",
-    /// và admin không còn tự ý chuyển tiền được nữa.
+    /// This is the one and only bridge from MVP to governance. MVP: executor = admin.
+    /// Tier 3: call this once, pointing executor at the tribe-governance PDA — from
+    /// then on "allowed to execute" means "the proposal passed + the 24h timelock has
+    /// elapsed", and the admin can no longer move money on their own say-so.
     pub fn set_executor(ctx: Context<AdminOnly>, executor: Pubkey) -> Result<()> {
         ctx.accounts.vault.executor = executor;
         Ok(())
     }
 
-    /// Đăng ký một bộ ba (adapter × action × asset) được phép thực hiện.
+    /// Register a permitted triple (adapter × action × asset).
     ///
-    /// Xem `state::Capability` để hiểu vì sao "được phép" không thể là một cờ
-    /// boolean trên Asset.
+    /// See `state::Capability` for why "permitted" cannot be a boolean flag on
+    /// Asset.
     ///
-    /// MVP: admin đăng ký. Nhưng capability MỞ MỘT ĐƯỜNG TIỀN MỚI ra khỏi vault —
-    /// nguy hiểm ngang việc thêm adapter — nên có lẽ phải chuyển sang governance
-    /// ngay từ Tầng 3, không đợi tới Tầng 4.
+    /// MVP: the admin registers these. But a capability OPENS A NEW MONEY PATH out
+    /// of the vault — just as dangerous as adding an adapter — so it should probably
+    /// move to governance as early as Tier 3, not wait for Tier 4.
     pub fn register_capability(
         ctx: Context<RegisterCapability>,
         action_id: ActionId,
@@ -148,39 +152,40 @@ pub mod tribe_vault {
     ) -> Result<()> {
         let clock = Clock::get()?;
 
-        // Adapter phải là loại ACTION — Pricing adapter không di chuyển tiền.
+        // The adapter must be of kind ACTION — a Pricing adapter does not move money.
         let adapter = &ctx.accounts.adapter;
         require!(
             adapter.kind == AdapterKind::Action,
             TribeError::WrongAdapterKind
         );
 
-        // Adapter phải đã sống thật: enabled và đã qua timelock 7 ngày của chính
-        // nó. Không cho phép cấp quyền cho một adapter chưa có hiệu lực.
+        // The adapter must genuinely be live: enabled and past its own 7-day timelock.
+        // Do NOT allow granting rights to an adapter that is not yet in effect.
         require!(adapter.enabled, TribeError::AdapterDisabled);
         require!(
             clock.unix_timestamp >= adapter.active_at,
             TribeError::AdapterNotActive
         );
 
-        // Asset đầu vào phải đã đăng ký trong đúng vault này.
+        // The input asset must be registered in this exact vault.
         require_keys_eq!(
             ctx.accounts.asset.vault,
             ctx.accounts.vault.key(),
             TribeError::AssetNotRegistered
         );
 
-        // --- Kiểm tra sống còn: receipt token phải được NAV nhìn thấy ---
+        // --- Life-or-death check: the receipt token MUST be visible to NAV ---
         //
-        // Vault KHÔNG suy ra được từ `action_id` là action này có sinh receipt token
-        // hay không — nó không hiểu ngữ nghĩa. Nên governance phải KHAI BÁO: truyền
-        // `receipt_asset` vào nếu action sinh ra kToken/LST.
+        // The vault CANNOT infer from `action_id` whether this action produces a
+        // receipt token — it does not understand the semantics. So governance must
+        // DECLARE it: pass in `receipt_asset` if the action mints a kToken/LST.
         //
-        // Và nếu có khai, vault kiểm tra chéo rất chặt. Không có kiểm tra này thì
-        // vault lend 1M USDC đi, nhận về kToken mà NAV không hề biết tới — NAV tụt
-        // đúng 1M, người deposit sau mint share với giá rẻ giả tạo, và mọi người
-        // đang giữ share bị pha loãng đúng 1M. Một lệnh lend hợp lệ hoàn toàn về mặt
-        // CPI vẫn rút ruột được vault, chỉ vì kế toán mù.
+        // And if it is declared, the vault cross-checks it very strictly. Without this
+        // check, the vault lends out 1M USDC, gets back a kToken that NAV knows nothing
+        // about — NAV drops by exactly 1M, later depositors mint shares at an artificially
+        // cheap price, and everyone currently holding shares is diluted by exactly 1M. A
+        // lend that is perfectly valid at the CPI level still drains the vault, purely
+        // because the accounting goes blind.
         let receipt_mint = match ctx.accounts.receipt_asset.as_ref() {
             Some(receipt) => {
                 require_keys_eq!(
@@ -189,15 +194,15 @@ pub mod tribe_vault {
                     TribeError::ReceiptAssetNotRegistered
                 );
 
-                // Receipt token là một POSITION, không phải SPL token thường — nếu
-                // nó là SplToken thì đã có Pyth feed và không cần pricing adapter.
+                // A receipt token is a POSITION, not an ordinary SPL token — if it were
+                // an SplToken it would already have a Pyth feed and need no pricing adapter.
                 require!(
                     receipt.kind != AssetKind::SplToken,
                     TribeError::ReceiptKindMismatch
                 );
 
-                // Position phải có pricing adapter, nếu không NAV sẽ fail thẳng khi
-                // gặp nó — và vault đóng băng ngay sau lệnh lend đầu tiên.
+                // A position MUST have a pricing adapter, otherwise NAV fails outright the
+                // moment it meets one — and the vault freezes right after the first lend.
                 require!(
                     receipt.pricing_adapter != Pubkey::default(),
                     TribeError::PricingAdapterMismatch
@@ -205,7 +210,7 @@ pub mod tribe_vault {
 
                 receipt.mint
             }
-            // Swap không sinh receipt mới — vault vẫn giữ token thường.
+            // A swap produces no new receipt — the vault still holds ordinary tokens.
             None => Pubkey::default(),
         };
 
@@ -239,24 +244,25 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Tắt một capability. Có hiệu lực NGAY, không timelock.
+    /// Disable a capability. Takes effect IMMEDIATELY, no timelock.
     ///
-    /// Đóng một đường tiền ra khỏi vault phải nhanh. Nhưng lưu ý: tắt một capability
-    /// `is_entry = true` (lend) KHÔNG khoá được tiền đã lend — capability thoát
-    /// (`is_entry = false`, unlend) vẫn chạy được, vì cửa ra không bao giờ đóng.
+    /// Closing a money path out of the vault has to be fast. But note: disabling an
+    /// `is_entry = true` capability (lend) does NOT lock up money already lent — the
+    /// exit capability (`is_entry = false`, unlend) still runs, because the exit is
+    /// never closed.
     pub fn disable_capability(ctx: Context<DisableCapability>) -> Result<()> {
         ctx.accounts.capability.enabled = false;
         Ok(())
     }
 
-    /// Đăng ký adapter mới (Jupiter, Kamino...).
+    /// Register a new adapter (Jupiter, Kamino, ...).
     ///
-    /// Adapter KHÔNG dùng được ngay: phải chờ hết timelock 7 ngày. Dài hơn hẳn
-    /// timelock giao dịch thường (24h) và có chủ đích — adapter được cấp quyền
-    /// điều khiển tiền vault, nên cộng đồng cần thời gian soi và redeem thoát
-    /// ra nếu thấy đáng ngờ.
+    /// An adapter is NOT usable right away: it must wait out a 7-day timelock. That is
+    /// much longer than the ordinary transaction timelock (24h), and deliberately so —
+    /// an adapter is granted control over the vault's money, so the community needs time
+    /// to scrutinize it and redeem their way out if it looks suspicious.
     ///
-    /// MVP: admin đăng ký. Sau này: governance vote.
+    /// MVP: the admin registers these. Later: a governance vote.
     pub fn register_adapter(
         ctx: Context<RegisterAdapter>,
         program_id: Pubkey,
@@ -270,8 +276,8 @@ pub mod tribe_vault {
 
         adapter.vault = ctx.accounts.vault.key();
         adapter.program_id = program_id;
-        // Action (untrusted, verify được bằng NAV-delta) hay Pricing (trusted, feed
-        // thẳng vào NAV). Hai mức tin cậy khác nhau về bản chất — xem AdapterKind.
+        // Action (untrusted, verifiable via NAV-delta) or Pricing (trusted, feeds straight
+        // into NAV). Two fundamentally different trust levels — see AdapterKind.
         adapter.kind = kind;
         adapter.label = label;
         adapter.enabled = true;
@@ -284,25 +290,25 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Tắt một adapter. Có hiệu lực NGAY, không timelock.
+    /// Disable an adapter. Takes effect IMMEDIATELY, no timelock.
     ///
-    /// Bất đối xứng có chủ đích: mở cửa thì chậm (7 ngày), đóng cửa thì tức
-    /// thì. Khi phát hiện adapter hỏng, cầm máu phải nhanh.
+    /// A deliberate asymmetry: opening the door is slow (7 days), closing it is instant.
+    /// When a broken adapter is discovered, you have to stop the bleeding fast.
     pub fn disable_adapter(ctx: Context<DisableAdapter>) -> Result<()> {
         ctx.accounts.adapter.enabled = false;
         Ok(())
     }
 
-    /// Thực thi một action lên tài sản của vault, qua adapter.
+    /// Execute an action on the vault's assets, through an adapter.
     ///
-    /// MỘT cổng duy nhất cho MỌI action — swap, lend, stake, LP, và cả những action
-    /// chưa tồn tại. Vault KHÔNG hiểu ngữ nghĩa của `action_id`; nó chỉ kiểm chứng
-    /// kết quả bằng NAV-delta.
+    /// ONE single gate for EVERY action — swap, lend, stake, LP, and even actions that
+    /// do not exist yet. The vault does NOT understand the semantics of `action_id`; it
+    /// only verifies the result via NAV-delta.
     ///
-    /// Đó là lý do thêm một action mới không phải upgrade vault: deploy adapter mới
-    /// + governance ghi một dòng vào registry, xong.
+    /// That is why adding a new action does not require upgrading the vault: deploy a new
+    /// adapter + have governance write one line into the registry, done.
     ///
-    /// Xem `execute.rs`.
+    /// See `execute.rs`.
     pub fn execute_action<'info>(
         ctx: Context<'_, '_, 'info, 'info, ExecuteAction<'info>>,
         action_id: ActionId,
@@ -312,10 +318,30 @@ pub mod tribe_vault {
         execute::execute_action(ctx, action_id, amount_in, payload)
     }
 
-    /// Gửi tài sản vào vault, nhận share.
+    /// Enforce that every asset stays within its exposure cap.
     ///
-    /// remaining_accounts: bộ ba [Asset, token account vault, Pyth price] cho
-    /// MỌI asset đã đăng ký, đúng thứ tự `Vault::asset_mints`.
+    /// BUNDLE IT IN THE SAME TRANSACTION as `execute_action`:
+    ///
+    /// ```text
+    ///   [ix 0]  execute_action(...)     <- swap
+    ///   [ix 1]  assert_exposure()       <- check afterwards
+    /// ```
+    ///
+    /// Same transaction → still atomic: if the cap is breached, the swap rolls back too.
+    ///
+    /// It has to be a separate instruction because exposure needs the full NAV (pricing
+    /// EVERY asset), and `execute_action` has already run out of compute — Jupiter alone
+    /// requests the full 1.4M CU ceiling. This instruction gets its own 200k CU.
+    pub fn assert_exposure<'info>(
+        ctx: Context<'_, '_, 'info, 'info, AssertExposure<'info>>,
+    ) -> Result<()> {
+        execute::assert_exposure(ctx)
+    }
+
+    /// Deposit assets into the vault, receive shares.
+    ///
+    /// remaining_accounts: the triple [Asset, vault token account, Pyth price] for EVERY
+    /// registered asset, in exactly the order of `Vault::asset_mints`.
     pub fn deposit<'info>(
         ctx: Context<'_, '_, 'info, 'info, Deposit<'info>>,
         amount: u64,
@@ -325,11 +351,12 @@ pub mod tribe_vault {
 
         let clock = Clock::get()?;
 
-        // NAV phải được tính TRƯỚC khi token của người deposit chạm vào vault.
+        // NAV MUST be computed BEFORE the depositor's tokens touch the vault.
         //
-        // Nếu tính sau, tiền của họ đã nằm trong NAV, nên họ được mint share
-        // dựa trên chính khoản vừa gửi — tự pha loãng chính mình và mọi người.
-        // Thứ tự ở đây là bắt buộc, không phải phong cách.
+        // If it were computed afterwards, their money would already be inside NAV, so they
+        // would be minted shares based on the very amount they just sent — diluting
+        // themselves and everyone else. The ordering here is mandatory, not a matter of
+        // style.
         let vault_key = ctx.accounts.vault.key();
         let snapshot = compute_nav(
             &ctx.accounts.vault,
@@ -340,7 +367,7 @@ pub mod tribe_vault {
         let nav_before = snapshot.total_value;
         let total_shares = ctx.accounts.vault.total_shares;
 
-        // Định giá đúng khoản đang gửi, bằng chính giá vừa xác thực ở trên.
+        // Price the amount actually being deposited, using the very price validated above.
         let deposit_value = deposit_value_in_quote(
             &ctx.accounts.vault,
             &ctx.accounts.asset,
@@ -351,13 +378,13 @@ pub mod tribe_vault {
 
         let mut shares = shares_for_deposit(deposit_value, nav_before, total_shares)?;
 
-        // Lần deposit đầu tiên: khóa vĩnh viễn một ít share.
+        // First deposit: permanently lock away a small amount of shares.
         //
-        // Chống inflation attack: không có nó, kẻ tấn công deposit 1 unit (nhận
-        // 1 share), rồi chuyển thẳng một lượng lớn token vào vault để thổi giá
-        // share lên. Người deposit sau bị làm tròn về 0 share, và tiền của họ
-        // rơi vào tay kẻ tấn công. Khóa cứng MINIMUM_LIQUIDITY khiến đòn này
-        // không còn lãi.
+        // This blocks the inflation attack: without it, an attacker deposits 1 unit
+        // (receiving 1 share), then transfers a large amount of tokens directly into the
+        // vault to inflate the share price. The next depositor gets rounded down to 0
+        // shares, and their money falls into the attacker's hands. Hard-locking
+        // MINIMUM_LIQUIDITY makes the attack unprofitable.
         if total_shares == 0 {
             require!(shares > MINIMUM_LIQUIDITY, TribeError::DepositTooSmall);
             shares = shares
@@ -368,7 +395,7 @@ pub mod tribe_vault {
 
         require!(shares > 0, TribeError::ZeroSharesMinted);
 
-        // Chuyển token vào vault trước, mint share sau.
+        // Transfer the tokens into the vault first, mint shares afterwards.
         token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -422,14 +449,15 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Bước 1/3 của redeem: burn share, chốt cứng phần tài sản được nhận.
+    /// Step 1/3 of redeem: burn shares, lock in the assets to be received.
     ///
-    /// KHÔNG bị chặn bởi pause — người dùng luôn rút được tiền.
+    /// NOT blocked by pause — users can always get their money out.
     ///
-    /// Vault giữ tới 24 asset nên không thể trả hết trong một transaction. Lệnh
-    /// này burn share và ghi ra một "phiếu nhận hàng" bất biến. Số lượng chốt
-    /// tại đây, không phụ thuộc NAV về sau: giá chạy thế nào thì người redeem
-    /// vẫn nhận đúng tỷ lệ tài sản tại thời điểm burn.
+    /// The vault holds up to 24 assets, so it cannot pay them all out in one transaction.
+    /// This instruction burns the shares and writes out an immutable "claim ticket". The
+    /// amounts are locked in here and do not depend on later NAV: whatever prices do
+    /// afterwards, the redeemer still receives exactly their pro-rata share of the assets
+    /// as of the moment of the burn.
     pub fn redeem_request<'info>(
         ctx: Context<'_, '_, 'info, 'info, RedeemRequest<'info>>,
         shares: u64,
@@ -447,21 +475,21 @@ pub mod tribe_vault {
             TribeError::InsufficientShares
         );
 
-        // Số dư KHẢ DỤNG, đọc từ token account thật, trừ đi phần đã hứa cho những
-        // người redeem trước.
+        // The AVAILABLE balance, read from the real token accounts, minus whatever has
+        // already been promised to earlier redeemers.
         //
-        // KHÔNG dùng oracle ở đây. Redeem là phép chia tỷ lệ thuần — giá không xuất
-        // hiện trong công thức. Gọi oracle sẽ làm redeem fail khi giá stale, tức là
-        // đúng lúc thị trường hỗn loạn và người dùng cần rút tiền nhất. Xem
-        // `nav::available_balances`.
+        // Do NOT use the oracle here. Redeem is a pure pro-rata division — price does not
+        // appear anywhere in the formula. Calling the oracle would make redeem fail when
+        // prices go stale, i.e. exactly when the market is in chaos and users need to get
+        // their money out most. See `nav::available_balances`.
         let balances = available_balances(
             &ctx.accounts.vault,
             &vault_key,
             ctx.remaining_accounts,
         )?;
 
-        // Chốt phần được nhận của từng asset, làm tròn xuống. Phần lẻ ở lại
-        // vault cho những người còn nắm share.
+        // Lock in the amount owed for each asset, rounding down. The dust stays in the
+        // vault for whoever still holds shares.
         let mut amounts = Vec::with_capacity(asset_count);
         let mut remaining_count: u8 = 0;
         for i in 0..asset_count {
@@ -471,12 +499,12 @@ pub mod tribe_vault {
                     .checked_add(1)
                     .ok_or(TribeError::MathOverflow)?;
 
-                // KHOÁ phần này lại. Từ giờ tới lúc người dùng claim, không ai được
-                // đụng vào: NAV không tính nó, và `execute` không tiêu được nó.
+                // LOCK this portion away. From now until the user claims it, nobody may
+                // touch it: NAV does not count it, and `execute` cannot spend it.
                 //
-                // Không có bước này, `execute` có thể swap đi đúng số token vừa hứa —
-                // tới lúc claim thì vault không còn đủ, share đã burn mất rồi mà tài
-                // sản thì kẹt trong một cái phiếu vô dụng.
+                // Without this step, `execute` could swap away the exact tokens that were
+                // just promised — by claim time the vault no longer has enough, the shares
+                // are already burned, and the assets are stuck inside a worthless ticket.
                 add_reserved(&ctx.remaining_accounts[i * 2], amount)?;
             }
             amounts.push(amount);
@@ -529,10 +557,11 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Bước 2/3: rút một asset từ phiếu. Gọi lặp lại cho tới khi hết.
+    /// Step 2/3: withdraw one asset from the ticket. Call repeatedly until none are left.
     ///
-    /// Chống double-claim bằng bitmap trong ticket. Đây là chốt chặn quan trọng
-    /// nhất của redeem: hỏng nó thì một phiếu rút được cùng một asset nhiều lần.
+    /// Double-claim is prevented by the bitmap in the ticket. This is the single most
+    /// important guard in redeem: break it and one ticket can withdraw the same asset
+    /// multiple times.
     pub fn claim_asset(ctx: Context<ClaimAsset>, asset_index: u8) -> Result<()> {
         let idx = asset_index as usize;
 
@@ -545,9 +574,9 @@ pub mod tribe_vault {
             TribeError::AssetAlreadyClaimed
         );
 
-        // Asset phải khớp ẢNH CHỤP lúc tạo phiếu, không phải danh sách hiện tại
-        // của vault. Admin có thêm/bớt asset giữa chừng thì phiếu vẫn trả đúng
-        // những gì đã hứa lúc burn share.
+        // The asset must match the SNAPSHOT taken when the ticket was created, not the
+        // vault's current list. Even if the admin adds/removes assets in the meantime, the
+        // ticket still pays out exactly what was promised when the shares were burned.
         require!(
             ctx.accounts.asset.mint == ctx.accounts.ticket.asset_mints[idx],
             TribeError::TicketAssetMismatch
@@ -579,11 +608,13 @@ pub mod tribe_vault {
                 ctx.accounts.mint.decimals,
             )?;
 
-            // Nhả khoá: token đã ra khỏi vault, phần "hứa nhưng chưa trả" giảm đi.
+            // Release the lock: the tokens have left the vault, so the "promised but not
+            // yet paid" amount goes down.
             //
-            // Phải khớp CHÍNH XÁC với phần đã cộng lúc redeem_request. Nếu trừ hụt,
-            // `reserved` sẽ phình lên vĩnh viễn và dần khoá chết cả vault — NAV tụt
-            // dần, và adapter không tiêu được tài sản nào nữa.
+            // This MUST match EXACTLY the amount added during redeem_request. If we
+            // subtract too little, `reserved` inflates permanently and gradually locks the
+            // whole vault dead — NAV drifts downward, and adapters can no longer spend any
+            // assets at all.
             let asset = &mut ctx.accounts.asset;
             asset.reserved = asset
                 .reserved
@@ -611,7 +642,7 @@ pub mod tribe_vault {
         Ok(())
     }
 
-    /// Bước 3/3: đóng phiếu đã claim hết, hoàn rent về cho chủ.
+    /// Step 3/3: close a fully claimed ticket, refunding the rent to its owner.
     pub fn close_ticket(ctx: Context<CloseTicket>) -> Result<()> {
         require!(
             ctx.accounts.ticket.remaining_count == 0,
@@ -621,11 +652,12 @@ pub mod tribe_vault {
     }
 }
 
-/// Định giá đúng khoản token đang được gửi vào.
+/// Price exactly the amount of tokens being deposited.
 ///
-/// Dùng lại chính oracle đã xác thực trong `compute_nav` — không đọc giá riêng,
-/// để giá dùng cho NAV và giá dùng cho khoản deposit luôn là một. Lấy hai giá
-/// khác nhau trong cùng một lệnh là mở đường cho chênh lệch bị khai thác.
+/// Reuses the very oracle already validated in `compute_nav` — it does not read a separate
+/// price, so that the price used for NAV and the price used for the deposit are always one
+/// and the same. Taking two different prices within a single instruction opens the door to
+/// an exploitable discrepancy.
 fn deposit_value_in_quote<'info>(
     vault: &Account<'info, Vault>,
     asset: &Account<'info, Asset>,
@@ -639,7 +671,7 @@ fn deposit_value_in_quote<'info>(
         TribeError::AssetNotRegistered
     );
 
-    // Oracle của asset này nằm ở vị trí thứ 3 trong bộ ba của nó.
+    // This asset's oracle sits in the 3rd slot of its triple.
     let oracle_info: &AccountInfo<'info> = &remaining[idx * 3 + 2];
     require_keys_eq!(
         asset.oracle,
@@ -678,16 +710,16 @@ pub struct InitializeVault<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// PDA sở hữu mọi token account của vault. Không ai giữ private key của nó.
-    /// CHECK: PDA thuần tuý, chỉ dùng để ký CPI.
+    /// The PDA that owns every token account of the vault. Nobody holds its private key.
+    /// CHECK: a pure PDA, used only to sign CPIs.
     #[account(
         seeds = [VAULT_AUTHORITY_SEED, vault.key().as_ref()],
         bump
     )]
     pub vault_authority: UncheckedAccount<'info>,
 
-    /// Mint của share. Quyền mint nằm ở vault_authority — nếu để chỗ khác,
-    /// người ta in được share từ hư không và rút sạch vault.
+    /// The share mint. Mint authority lives on vault_authority — if it lived anywhere
+    /// else, someone could print shares out of thin air and drain the vault.
     #[account(
         init,
         payer = admin,
@@ -696,7 +728,7 @@ pub struct InitializeVault<'info> {
     )]
     pub share_mint: Box<InterfaceAccount<'info, Mint>>,
 
-    /// CHECK: chỉ lưu địa chỉ nhận fee, không đọc dữ liệu.
+    /// CHECK: we only store the fee-recipient address, we never read its data.
     pub treasury: UncheckedAccount<'info>,
 
     pub token_program: Interface<'info, TokenInterface>,
@@ -716,7 +748,7 @@ pub struct RegisterAsset<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// CHECK: PDA, dùng làm authority của token account.
+    /// CHECK: PDA, used as the authority of the token account.
     #[account(
         seeds = [VAULT_AUTHORITY_SEED, vault.key().as_ref()],
         bump = vault.vault_authority_bump,
@@ -734,19 +766,39 @@ pub struct RegisterAsset<'info> {
     )]
     pub asset: Box<Account<'info, Asset>>,
 
-    /// Token account của vault cho asset này. Authority BẮT BUỘC là
-    /// vault_authority — nếu không, tiền nằm dưới quyền người khác.
+    /// The vault's token account for this asset.
+    ///
+    /// It MUST be the canonical **Associated Token Account** of vault_authority. Two
+    /// separate reasons, and both are load-bearing:
+    ///
+    /// 1. **The authority must be vault_authority** — otherwise the money sits under
+    ///    someone else's control.
+    ///
+    /// 2. **The address must be the ATA** — otherwise the vault cannot trade on any real
+    ///    DEX. Jupiter (and every other DEX) derives the user's token accounts as ATAs
+    ///    and bakes those exact addresses into the instruction it hands back. Give it a
+    ///    token account at some other address and it fails account validation before a
+    ///    single lamport moves.
+    ///
+    ///    This was found the hard way: registering assets with freshly generated keypair
+    ///    accounts worked perfectly against a mock DEX (which used whatever accounts it
+    ///    was given) and then failed against the real Jupiter with error 0x1789.
+    ///
+    /// A vault that wants to route through real venues does not get to choose where its
+    /// token accounts live. They have to be where the rest of Solana looks for them.
     #[account(
         init,
         payer = admin,
-        token::mint = mint,
-        token::authority = vault_authority,
+        associated_token::mint = mint,
+        associated_token::authority = vault_authority,
     )]
     pub vault_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    /// CHECK: Pyth price update. Được xác thực đầy đủ mỗi lần đọc giá (feed_id,
-    /// độ tươi, độ tin cậy) trong `oracle::get_validated_price`.
+    /// CHECK: Pyth price update. Fully validated on every price read (feed_id, staleness,
+    /// confidence) in `oracle::get_validated_price`.
     pub oracle: UncheckedAccount<'info>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -785,16 +837,16 @@ pub struct RegisterCapability<'info> {
     )]
     pub adapter: Box<Account<'info, Adapter>>,
 
-    /// Asset đầu vào của action này.
+    /// The input asset of this action.
     #[account(
         seeds = [ASSET_SEED, vault.key().as_ref(), asset.mint.as_ref()],
         bump = asset.bump,
     )]
     pub asset: Box<Account<'info, Asset>>,
 
-    /// Asset của receipt token (kToken, LST), BẮT BUỘC có mặt khi action là
-    /// Lend hoặc Stake. Xem `Capability::receipt_mint` — thiếu nó là NAV mù và
-    /// vault bị pha loãng đúng bằng số tiền đem đi lend.
+    /// The Asset of the receipt token (kToken, LST). It MUST be present when the action is
+    /// Lend or Stake. See `Capability::receipt_mint` — without it, NAV goes blind and the
+    /// vault is diluted by exactly the amount taken out to lend.
     #[account(
         seeds = [ASSET_SEED, vault.key().as_ref(), receipt_asset.mint.as_ref()],
         bump = receipt_asset.bump,
@@ -857,7 +909,7 @@ pub struct Deposit<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// CHECK: PDA ký cho việc mint share.
+    /// CHECK: the PDA that signs for minting shares.
     #[account(
         seeds = [VAULT_AUTHORITY_SEED, vault.key().as_ref()],
         bump = vault.vault_authority_bump,
@@ -905,8 +957,8 @@ pub struct RedeemRequest<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
 
-    // Chú ý: KHÔNG kiểm tra `paused` ở đây. Có chủ đích.
-    // Redeem phải sống được kể cả khi protocol đóng băng.
+    // Note: there is NO `paused` check here. That is deliberate.
+    // Redeem must keep working even when the protocol is frozen.
     #[account(
         mut,
         seeds = [VAULT_SEED],
@@ -953,7 +1005,7 @@ pub struct ClaimAsset<'info> {
     )]
     pub vault: Box<Account<'info, Vault>>,
 
-    /// CHECK: PDA ký cho việc chuyển tài sản ra.
+    /// CHECK: the PDA that signs for transferring assets out.
     #[account(
         seeds = [VAULT_AUTHORITY_SEED, vault.key().as_ref()],
         bump = vault.vault_authority_bump,
@@ -974,7 +1026,8 @@ pub struct ClaimAsset<'info> {
     )]
     pub ticket: Box<Account<'info, RedeemTicket>>,
 
-    /// `mut` vì claim_asset giảm `asset.reserved` — nhả khoá phần vừa trả cho user.
+    /// `mut` because claim_asset decrements `asset.reserved` — releasing the lock on the
+    /// portion just paid out to the user.
     #[account(
         mut,
         seeds = [ASSET_SEED, vault.key().as_ref(), mint.key().as_ref()],

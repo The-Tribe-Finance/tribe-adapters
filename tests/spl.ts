@@ -16,9 +16,10 @@ import {
 } from "@solana/spl-token";
 import { BankrunProvider } from "anchor-bankrun";
 
-/// `@solana/spl-token` cung cấp sẵn createMint/mintTo, nhưng chúng đòi một
-/// `Connection` thật (gọi sendTransaction). BankrunProvider không có — nó chạy
-/// trên một ledger trong bộ nhớ. Nên phải dựng instruction thô và gửi qua provider.
+/// `@solana/spl-token` already ships createMint/mintTo, but they require a real
+/// `Connection` (they call sendTransaction). BankrunProvider has none — it runs against
+/// an in-memory ledger. So we have to build the raw instructions and send them through
+/// the provider.
 
 export async function createMint(
   provider: BankrunProvider,
@@ -26,7 +27,7 @@ export async function createMint(
   decimals: number
 ): Promise<PublicKey> {
   const mint = Keypair.generate();
-  const rent = 1_461_600; // rent-exempt cho MINT_SIZE (82 byte)
+  const rent = 1_461_600; // rent-exempt for MINT_SIZE (82 bytes)
 
   const tx = new Transaction().add(
     SystemProgram.createAccount({
@@ -54,9 +55,9 @@ export async function createAta(
   mint: PublicKey,
   owner: PublicKey
 ): Promise<PublicKey> {
-  // allowOwnerOffCurve = true: chủ sở hữu có thể là một PDA (vault_authority,
-  // pool_authority), không chỉ ví thường. PDA nằm ngoài đường cong ed25519 nên
-  // hàm này mặc định từ chối chúng.
+  // allowOwnerOffCurve = true: the owner may be a PDA (vault_authority, pool_authority),
+  // not just an ordinary wallet. PDAs lie off the ed25519 curve, so this function rejects
+  // them by default.
   const ata = getAssociatedTokenAddressSync(mint, owner, true);
   const tx = new Transaction().add(
     createAssociatedTokenAccountInstruction(payer.publicKey, ata, owner, mint)
@@ -78,13 +79,13 @@ export async function mintTo(
   await provider.sendAndConfirm(tx, [mintAuthority]);
 }
 
-/// Đọc số dư một token account thẳng từ ledger của bankrun.
+/// Read a token account's balance straight from bankrun's ledger.
 export async function tokenBalance(
   provider: BankrunProvider,
   address: PublicKey
 ): Promise<bigint> {
   const acc = await provider.context.banksClient.getAccount(address);
-  if (!acc) throw new Error(`token account không tồn tại: ${address}`);
+  if (!acc) throw new Error(`token account does not exist: ${address}`);
   return AccountLayout.decode(Buffer.from(acc.data)).amount;
 }
 

@@ -15,46 +15,49 @@ pub const ADAPTER_SEED: &[u8] = b"adapter";
 #[constant]
 pub const CAPABILITY_SEED: &[u8] = b"capability";
 
-/// Timelock để một adapter mới có hiệu lực: 7 ngày.
+/// Delay before a newly registered adapter becomes usable: 7 days.
 ///
-/// Dài hơn hẳn timelock giao dịch thường (24h) và có chủ đích: adapter được
-/// cấp quyền điều khiển tiền vault, nên cộng đồng cần đủ thời gian soi và
-/// redeem thoát ra nếu thấy đáng ngờ.
+/// Deliberately much longer than a regular trade timelock (24h). An adapter is
+/// granted authority over vault funds, so the community needs time to inspect it —
+/// and to redeem out if it looks suspicious.
 pub const ADAPTER_TIMELOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-/// Timelock để một capability mới có hiệu lực: 7 ngày, bằng adapter.
+/// Delay before a newly registered capability becomes usable: 7 days, same as adapters.
 ///
-/// Thêm một capability = mở một ĐƯỜNG TIỀN MỚI ra khỏi vault. Nguy hiểm ngang
-/// việc thêm adapter, nên chịu cùng thời gian chờ. Gỡ thì có hiệu lực ngay —
-/// vẫn là "mở cửa thì chậm, đóng cửa thì tức thì".
+/// Registering a capability opens a NEW PATH for funds to leave the vault. That is as
+/// dangerous as adding an adapter, so it waits just as long. Removal takes effect
+/// immediately — "opening doors is slow, closing them is instant".
 pub const CAPABILITY_TIMELOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-/// Số tài sản tối đa vault có thể nắm giữ.
+/// Maximum number of assets the vault can hold.
 pub const MAX_ASSETS: usize = 24;
 
-/// Giá Pyth cũ hơn ngưỡng này (giây) bị coi là không hợp lệ.
+/// A Pyth price older than this (seconds) is rejected.
 pub const MAX_PRICE_AGE_SECONDS: u64 = 60;
 
-/// Đơn vị kế toán của protocol: USDC có 6 decimals.
+/// The protocol's unit of account: USDC, 6 decimals.
 pub const QUOTE_DECIMALS: u8 = 6;
 pub const SHARE_DECIMALS: u8 = 6;
 
-/// Deposit tối thiểu, chặn lỗi làm tròn từ các khoản siêu nhỏ.
+/// Minimum deposit. Blocks rounding exploits from dust-sized deposits.
 pub const MIN_DEPOSIT: u64 = 1_000_000; // 1 USDC
 
-/// Share tối thiểu bị khóa vĩnh viễn trong lần deposit đầu tiên.
+/// Shares permanently locked on the very first deposit.
 ///
-/// Chống inflation attack: kẻ tấn công deposit 1 unit rồi donate trực tiếp một
-/// lượng lớn token vào vault để thổi giá share, khiến người deposit sau bị làm
-/// tròn về 0 share. Khóa cứng một ít share đầu tiên làm cho đòn này không có lãi.
+/// Defends against the inflation attack: without it, an attacker deposits 1 unit
+/// (receiving 1 share), then transfers a large amount of tokens directly into the
+/// vault to inflate the share price. The next depositor's shares round down to zero,
+/// and their money lands in the attacker's pocket. Burning a small amount of the first
+/// shares makes that attack unprofitable.
 pub const MINIMUM_LIQUIDITY: u64 = 1_000;
 
-/// Thang chia tỷ lệ dùng cho mọi phép tính phần trăm (1_000_000 = 100%).
+/// Scale used for every percentage computation (1_000_000 = 100%).
 pub const BPS_SCALE: u64 = 1_000_000;
 
-/// Slippage tối đa cho mỗi lần swap: 1%.
+/// Maximum value the vault may lose on a single action: 1% of the value sent in.
 ///
-/// Vault tự tính `min_out` = giá_Pyth − 1%, KHÔNG lấy từ payload của Jupiter.
-/// Nếu tin min_out do người gọi cung cấp, kẻ tấn công đưa route tồi kèm
-/// min_out = 0 và swap 1 triệu USDC lấy về 1 lamport — hoàn toàn "hợp lệ".
-pub const MAX_SLIPPAGE_BPS: u64 = 10_000; // 1% của 1_000_000
+/// This is enforced by the vault via value-delta, NOT by trusting anything the adapter
+/// says. Note it is anchored to the TRADE VALUE, not to total NAV — anchoring to NAV
+/// would widen the allowance as the vault grows, letting a single trade drain more the
+/// richer the vault gets. See `execute.rs`.
+pub const MAX_SLIPPAGE_BPS: u64 = 10_000; // 1% of 1_000_000

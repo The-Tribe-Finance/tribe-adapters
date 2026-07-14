@@ -1,31 +1,32 @@
 import { PublicKey } from "@solana/web3.js";
 
-/// Program id của Pyth Solana Receiver. `Account<PriceUpdateV2>` của Anchor kiểm
-/// tra owner, nên account giả BẮT BUỘC do program này sở hữu — nếu không,
-/// `Account::try_from` sẽ fail đúng như nó phải fail trên mainnet.
+/// The Pyth Solana Receiver's program id. Anchor's `Account<PriceUpdateV2>` checks the
+/// owner, so the fake account MUST be owned by this program — otherwise
+/// `Account::try_from` fails, exactly as it should on mainnet.
 export const PYTH_RECEIVER_PROGRAM_ID = new PublicKey(
   "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"
 );
 
-/// 8 byte đầu của sha256("account:PriceUpdateV2").
+/// The first 8 bytes of sha256("account:PriceUpdateV2").
 const DISCRIMINATOR = Buffer.from([34, 241, 35, 99, 157, 126, 244, 205]);
 
-/// Kích thước account, khớp `PriceUpdateV2::LEN` trong pyth-solana-receiver-sdk.
+/// The account size, matching `PriceUpdateV2::LEN` in pyth-solana-receiver-sdk.
 const LEN = 8 + 32 + 2 + 32 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8;
 
 export interface PriceConfig {
-  feedId: Buffer; // 32 byte
-  price: bigint; // giá thô, đã nhân 10^(-expo)
-  conf: bigint; // khoảng tin cậy
-  expo: number; // thường âm, ví dụ -8
+  feedId: Buffer; // 32 bytes
+  price: bigint; // raw price, already scaled by 10^(-expo)
+  conf: bigint; // confidence interval
+  expo: number; // usually negative, e.g. -8
   publishTime: bigint; // unix seconds
 }
 
-/// Dựng dữ liệu binary của một `PriceUpdateV2`, đúng layout Borsh mà program đọc.
+/// Build the binary data of a `PriceUpdateV2`, in exactly the Borsh layout the program
+/// reads.
 ///
-/// Phải dựng thủ công vì localnet không có Pyth. Sai một byte là test "xanh" trong
-/// khi program thật sẽ fail — nên layout ở đây được đối chiếu trực tiếp với
-/// pyth-solana-receiver-sdk 0.6.1 / pythnet-sdk 2.3.1:
+/// We have to build it by hand because localnet has no Pyth. One wrong byte and the test
+/// goes "green" while the real program would fail — so the layout here is cross-checked
+/// directly against pyth-solana-receiver-sdk 0.6.1 / pythnet-sdk 2.3.1:
 ///
 ///   PriceUpdateV2 { write_authority: Pubkey, verification_level: enum,
 ///                   price_message: PriceFeedMessage, posted_slot: u64 }
@@ -34,7 +35,7 @@ export interface PriceConfig {
 ///                      ema_price: i64, ema_conf: u64 }
 export function encodePriceUpdate(cfg: PriceConfig): Buffer {
   if (cfg.feedId.length !== 32) {
-    throw new Error(`feedId phải đúng 32 byte, nhận được ${cfg.feedId.length}`);
+    throw new Error(`feedId must be exactly 32 bytes, got ${cfg.feedId.length}`);
   }
 
   const buf = Buffer.alloc(LEN);
@@ -43,20 +44,20 @@ export function encodePriceUpdate(cfg: PriceConfig): Buffer {
   DISCRIMINATOR.copy(buf, o);
   o += 8;
 
-  // write_authority — không được đọc trong đường tính giá, để 0.
+  // write_authority — never read on the pricing path, leave it as zeros.
   o += 32;
 
-  // verification_level: enum Borsh.
+  // verification_level: a Borsh enum.
   //
   //   variant 0 = Partial { num_signatures: u8 }  -> 1 byte tag + 1 byte payload
-  //   variant 1 = Full                            -> 1 byte tag, KHÔNG payload
+  //   variant 1 = Full                            -> 1 byte tag, NO payload
   //
-  // PriceUpdateV2::LEN cấp phát 2 byte (theo variant lớn nhất), nhưng Borsh chỉ
-  // GHI RA 1 byte nếu là Full. Dùng Full thì mọi field sau bị lệch đúng 1 byte và
-  // feed_id đọc ra rác -> OracleFeedMismatch.
+  // PriceUpdateV2::LEN allocates 2 bytes (sized for the largest variant), but Borsh only
+  // WRITES OUT 1 byte if it is Full. Use Full and every subsequent field is off by
+  // exactly 1 byte, so feed_id reads back as garbage -> OracleFeedMismatch.
   //
-  // Nên dùng Partial: nó chiếm đúng 2 byte, khớp cả LEN lẫn cách Borsh ghi.
-  // Program không đọc field này nên giá trị không quan trọng.
+  // So use Partial: it occupies exactly 2 bytes, matching both LEN and the way Borsh
+  // writes it. The program does not read this field, so its value does not matter.
   buf.writeUInt8(0, o); // tag = Partial
   o += 1;
   buf.writeUInt8(5, o); // num_signatures
@@ -80,13 +81,14 @@ export function encodePriceUpdate(cfg: PriceConfig): Buffer {
   buf.writeBigUInt64LE(cfg.conf, o); // ema_conf
   o += 8;
 
-  // posted_slot — không được đọc.
+  // posted_slot — never read.
   o += 8;
 
   return buf;
 }
 
-/// Giá "khoẻ mạnh": tươi, conf hẹp (0.1% giá — dưới ngưỡng 2% của oracle.rs).
+/// A "healthy" price: fresh, with a narrow conf (0.1% of the price — below oracle.rs's
+/// 2% threshold).
 export function healthyPrice(
   feedId: Buffer,
   priceUsd: number,
@@ -102,7 +104,7 @@ export function healthyPrice(
   };
 }
 
-/// Feed id tất định từ một nhãn, để test đọc được.
+/// A deterministic feed id derived from a label, so tests stay readable.
 export function feedIdFor(label: string): Buffer {
   const b = Buffer.alloc(32);
   Buffer.from(label).copy(b);

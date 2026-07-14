@@ -5,64 +5,68 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::token_interface::TokenAccount;
 
-declare_id!("Swap111111111111111111111111111111111111111");
+declare_id!("3wQCqUNGMBZL3Pe1v1iyqvonKMNMHjgByEw7iBTGHwyN");
 
 /// # Action adapter — SWAP
 ///
-/// **Một program. Một action. Deploy một lần. Set immutable.**
+/// **One program. One action. Deploy once. Set immutable.**
 ///
-/// Đây là toàn bộ triết lý adapter, và nó đối lập với "một adapter đa năng rồi
-/// upgrade dần":
+/// This is the whole adapter philosophy, and it is the opposite of "one
+/// general-purpose adapter that gets upgraded over time":
 ///
 /// ```text
-/// KHÔNG NÊN                        NÊN
-/// ─────────                        ───
-/// 1 adapter "đa năng"              mỗi action = 1 adapter riêng
-/// thêm lending -> upgrade adapter  thêm lending -> deploy adapter MỚI
-///   -> code swap cũ có rủi ro        -> file này không bị đụng
-///   -> 1 upgrade lỗi = hỏng hết      -> adapter mới lỗi, chỉ nó bị revert
+/// DON'T                            DO
+/// ─────                            ──
+/// 1 "general-purpose" adapter      each action = its own adapter
+/// add lending -> upgrade adapter   add lending -> deploy a NEW adapter
+///   -> the old swap code is at risk  -> this file is never touched
+///   -> 1 bad upgrade = everything    -> a buggy new adapter only reverts
+///      breaks                           itself
 /// upgrade authority = attack surface  set immutable (upgrade = None)
 /// ```
 ///
-/// Thêm staking sau này: viết `adapter-stake`, deploy, governance whitelist nó.
-/// **File này không sửa một dòng nào.** Vault cũng vậy.
+/// Adding staking later: write `adapter-stake`, deploy it, have governance
+/// whitelist it. **Not a single line of this file changes.** Same for the vault.
 ///
-/// ## Adapter là UNTRUSTED — và điều đó có chủ đích
+/// ## The adapter is UNTRUSTED — and that is deliberate
 ///
-/// Vault KHÔNG tin những gì adapter này làm. Sau CPI, vault tự tính lại NAV và bắt
-/// buộc `NAV_sau >= NAV_trước × (1 − slippage)`. Adapter có bug, hay bị chiếm quyền,
-/// hay DEX đích bị tấn công — tất cả đều làm NAV tụt, và đều bị vault revert.
+/// The vault does NOT trust what this adapter does. After the CPI, the vault
+/// recomputes NAV itself and enforces `NAV_after >= NAV_before × (1 − slippage)`.
+/// A buggy adapter, a hijacked adapter, or a compromised target DEX — all of them
+/// make NAV drop, and all of them get reverted by the vault.
 ///
-/// Chính vì kiểm chứng được nên adapter được phép làm việc "khó" mà không cần audit
-/// ở mức core: nó tính `min_out`, nó hiểu layout của Jupiter, nó dựng route. Sai thì
-/// vault bắt.
+/// Precisely because it is verifiable, the adapter is allowed to do the "hard"
+/// work without being audited at core level: it computes `min_out`, it understands
+/// Jupiter's layout, it builds the route. If it gets it wrong, the vault catches it.
 ///
-/// (Đối lập: **Pricing adapter** feed thẳng vào NAV — không có gì để đo — nên nó là
-/// TRUSTED và phải audit như core.)
+/// (Contrast: a **Pricing adapter** feeds straight into NAV — there is nothing to
+/// measure it against — so it is TRUSTED and must be audited like core.)
 ///
-/// ## Vì sao min_out nằm ở ĐÂY, không ở vault
+/// ## Why min_out lives HERE, not in the vault
 ///
-/// `min_out` là khái niệm riêng của swap. Lend không có `min_out` (nó có
-/// `min_receipt`), staking cũng vậy. Nếu vault tính `min_out`, vault phải *hiểu* swap
-/// — và thêm lending sẽ phải sửa vault.
+/// `min_out` is a swap-specific concept. Lending has no `min_out` (it has
+/// `min_receipt`), and neither does staking. If the vault computed `min_out`, the
+/// vault would have to *understand* swaps — and adding lending would mean changing
+/// the vault.
 ///
-/// Nên vault chỉ kiểm chứng thứ AGNOSTIC (giá trị không giảm), còn logic riêng của
-/// từng action nằm ở adapter tương ứng.
+/// So the vault only verifies the AGNOSTIC thing (value must not drop), while the
+/// logic specific to each action lives in its corresponding adapter.
 #[program]
 pub mod adapter_swap {
     use super::*;
 
-    /// Action id của adapter này. Vault chỉ dùng con số này làm seed của
-    /// `Capability` — nó không hiểu, và không cần hiểu, rằng 0 nghĩa là "swap".
+    /// This adapter's action id. The vault only uses this number as a seed for the
+    /// `Capability` — it does not understand, and does not need to understand, that
+    /// 0 means "swap".
     pub const ACTION_SWAP: u8 = 0;
 
-    /// Swap `amount_in` của token vào lấy token ra, qua một DEX.
+    /// Swap `amount_in` of the input token for the output token, through a DEX.
     ///
-    /// Vault đã ký bằng PDA của nó (`vault_authority`) trước khi gọi vào đây, nên
-    /// adapter có quyền chuyển token của vault — nhưng CHỈ trong transaction này, và
-    /// chỉ với kết quả mà vault chấp nhận được.
+    /// The vault has already signed with its PDA (`vault_authority`) before calling
+    /// in here, so the adapter has the right to move the vault's tokens — but ONLY
+    /// within this transaction, and only with a result the vault finds acceptable.
     ///
-    /// remaining_accounts: account của DEX, adapter chuyển tiếp nguyên vẹn.
+    /// remaining_accounts: the DEX's accounts, forwarded verbatim by the adapter.
     pub fn swap<'info>(
         ctx: Context<'_, '_, 'info, 'info, Swap<'info>>,
         amount_in: u64,
@@ -71,22 +75,25 @@ pub mod adapter_swap {
     ) -> Result<()> {
         require!(amount_in > 0, SwapError::ZeroAmount);
 
-        // Đo trước — adapter tự bảo vệ mình, không phó mặc cho vault.
+        // Measure first — the adapter protects itself, it does not just leave it to
+        // the vault.
         //
-        // Vault SẼ kiểm tra lại bằng NAV-delta, nên lớp này là thừa về mặt an toàn.
-        // Nhưng nó cho ra thông báo lỗi ĐÚNG CHỖ: "DEX trả về ít hơn min_out" dễ
-        // hiểu hơn nhiều so với "NAV của vault tụt 3%".
+        // The vault WILL check again via NAV-delta, so this layer is redundant from a
+        // safety standpoint. But it produces the error message in the RIGHT PLACE:
+        // "the DEX returned less than min_out" is far easier to understand than "the
+        // vault's NAV dropped 3%".
         let balance_out_before = ctx.accounts.vault_token_out.amount;
 
-        // --- CPI sang DEX ---
+        // --- CPI into the DEX ---
         //
-        // Adapter không áp đặt thứ tự account — DEX có layout riêng của nó. Client
-        // dựng list (nó gọi API của DEX để lấy route nên có sẵn), adapter chuyển
-        // tiếp nguyên vẹn.
+        // The adapter does not impose an account ordering — each DEX has its own
+        // layout. The client builds the list (it already has it, since it calls the
+        // DEX's API to get the route), and the adapter forwards it verbatim.
         //
-        // Chữ ký của vault_authority được chuyển tiếp XUỐNG DEX: nó đã là signer khi
-        // vault invoke_signed vào adapter, và adapter forward tiếp. Đó là cách DEX
-        // rút được token từ token account của vault.
+        // The vault_authority's signature is forwarded DOWN to the DEX: it was already
+        // a signer when the vault did invoke_signed into the adapter, and the adapter
+        // passes it along. That is how the DEX is able to pull tokens out of the
+        // vault's token account.
         let authority_key = ctx.accounts.vault_authority.key();
 
         let mut metas: Vec<AccountMeta> = Vec::with_capacity(ctx.remaining_accounts.len());
@@ -97,8 +104,9 @@ pub mod adapter_swap {
             let key = acc.key();
             metas.push(AccountMeta {
                 pubkey: key,
-                // Chỉ vault_authority được ký. Không bao giờ cho account lạ mượn
-                // chữ ký — cùng nguyên tắc mà vault áp dụng với adapter.
+                // Only vault_authority is allowed to sign. NEVER lend the signature
+                // to an unknown account — the same principle the vault applies to the
+                // adapter.
                 is_signer: key == authority_key,
                 is_writable: acc.is_writable,
             });
@@ -111,12 +119,12 @@ pub mod adapter_swap {
             data: dex_payload, // opaque
         };
 
-        // Adapter KHÔNG có PDA riêng để ký. Chữ ký đang mang theo là của vault, được
-        // truyền xuống qua invoke (không phải invoke_signed) — vì adapter không sở
-        // hữu seed nào.
+        // The adapter has NO PDA of its own to sign with. The signature being carried
+        // here belongs to the vault, and is passed down via invoke (not invoke_signed)
+        // — because the adapter owns no seeds.
         anchor_lang::solana_program::program::invoke(&ix, &infos)?;
 
-        // --- Kiểm tra kết quả ---
+        // --- Check the result ---
 
         ctx.accounts.vault_token_out.reload()?;
         let received = ctx
@@ -140,19 +148,21 @@ pub mod adapter_swap {
 
 #[derive(Accounts)]
 pub struct Swap<'info> {
-    /// PDA của VAULT — signer, chữ ký do vault cấp qua invoke_signed.
+    /// The VAULT's PDA — a signer; the signature is granted by the vault via
+    /// invoke_signed.
     ///
-    /// Adapter chỉ MƯỢN chữ ký này trong đúng transaction hiện tại. Nó không giữ
-    /// được, không dùng lại được.
-    /// CHECK: vault đã xác thực đây là PDA của nó trước khi CPI vào đây.
+    /// The adapter merely BORROWS this signature for the current transaction. It
+    /// cannot keep it, and it cannot reuse it.
+    /// CHECK: the vault already verified this is its own PDA before doing the CPI here.
     pub vault_authority: Signer<'info>,
 
-    /// Token account đích của vault. Adapter đo nó để biết nhận về bao nhiêu.
+    /// The vault's destination token account. The adapter measures it to know how much
+    /// it received back.
     #[account(mut)]
     pub vault_token_out: InterfaceAccount<'info, TokenAccount>,
 
-    /// CHECK: DEX để CPI tới (Jupiter, Orca...). Vault đã whitelist adapter này;
-    /// adapter chịu trách nhiệm về DEX mà nó gọi.
+    /// CHECK: the DEX to CPI into (Jupiter, Orca, ...). The vault has whitelisted this
+    /// adapter; the adapter is responsible for the DEX it calls.
     pub dex_program: UncheckedAccount<'info>,
 }
 

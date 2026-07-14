@@ -30,25 +30,27 @@ const SOL_FEED = feedIdFor("sol-feed");
 const USDC_PRICE = 1;
 const SOL_PRICE = 100;
 
-/// action_id của adapter-swap. Vault KHÔNG hiểu con số này nghĩa là gì — nó chỉ
-/// dùng nó làm seed của Capability. Ngữ nghĩa "0 = swap" là quy ước của ADAPTER.
+/// adapter-swap's action_id. The vault does NOT understand what this number means — it
+/// only uses it as a seed for the Capability. The semantics "0 = swap" are the
+/// ADAPTER's convention.
 const ACTION_SWAP = 0;
 
 /**
- * Test cho `execute_action` — nơi tiền rời khỏi vault.
+ * Tests for `execute_action` — where money leaves the vault.
  *
- * Chuỗi CPI thật của kiến trúc:
+ * The architecture's real CPI chain:
  *
  *     tribe-vault  ──►  adapter-swap  ──►  mock-dex
- *     (kiểm chứng)      (biết swap)        (đóng vai Jupiter)
+ *     (verifies)        (knows swaps)      (plays Jupiter)
  *
- * Câu hỏi mà file này trả lời:
+ * The questions this file answers:
  *
- *   1. Vault có kiểm chứng được kết quả MÀ KHÔNG cần hiểu swap không?
- *   2. Lớp NAV-delta có chặn được adapter gian lận không?
+ *   1. Can the vault verify the result WITHOUT understanding swaps?
+ *   2. Does the NAV-delta layer stop an adapter that misbehaves?
  *
- * `mock-dex` cố ý làm được những việc xấu — tiêu quá phần được phép, trả về ít hơn
- * cam kết, lấy tiền không trả gì. Mỗi test là một đòn tấn công cụ thể.
+ * `mock-dex` is deliberately capable of doing bad things — spending more than it is
+ * allowed to, returning less than it promised, taking money and returning nothing.
+ * Each test is one concrete attack.
  */
 describe("execute_action — vault → adapter → dex", () => {
   let ctx: ProgramTestContext;
@@ -132,8 +134,8 @@ describe("execute_action — vault → adapter → dex", () => {
   const vaultTokenAccount = async (mint: PublicKey) =>
     (await vaultProgram.account.asset.fetch(assetPda(mint))).tokenAccount;
 
-  /// Bộ ba (Asset, token account, oracle) cho MỌI asset — vùng ĐẦU của
-  /// remaining_accounts. Vault dùng để tính NAV trước VÀ sau CPI.
+  /// The triple (Asset, token account, oracle) for EVERY asset — used by deposit and
+  /// assert_exposure, the places that NEED a complete NAV.
   const navAccounts = async (): Promise<AccountMeta[]> => {
     const vault = await vaultProgram.account.vault.fetch(vaultPda);
     const out: AccountMeta[] = [];
@@ -146,7 +148,35 @@ describe("execute_action — vault → adapter → dex", () => {
     return out;
   };
 
-  /// CẶP (Asset, token account) — redeem không cần oracle.
+  /**
+   * Accounts for `execute_action` — a THREE-region layout.
+   *
+   *   [0, 2N)     (Asset, token) pairs for EVERY asset -> measure BALANCES (cheap)
+   *   [2N, 2N+2)  oracle_in, oracle_out                -> measure VALUE (expensive)
+   *   [2N+2, ..)  the adapter's accounts
+   *
+   * Why we do not pass an oracle for every asset: Jupiter *requests* the 1.4M CU
+   * ceiling — Solana's maximum — regardless of how complex the route is. It actually
+   * *consumes* far less (measured: ~72k CU for a 1-hop route, ~508k for a 3-hop one),
+   * so there is real compute budget left. But that headroom varies with the route and
+   * cannot be relied on, so we keep the vault's per-execute cost bounded: price only
+   * the two assets that actually change, and merely check balances for the rest,
+   * instead of pricing 24 assets × 2 passes.
+   */
+  const meterAccounts = async (): Promise<AccountMeta[]> => {
+    const vault = await vaultProgram.account.vault.fetch(vaultPda);
+    const out: AccountMeta[] = [];
+    for (const mint of vault.assetMints) {
+      const a = await vaultProgram.account.asset.fetch(assetPda(mint));
+      out.push({ pubkey: assetPda(mint), isSigner: false, isWritable: false });
+      out.push({ pubkey: a.tokenAccount, isSigner: false, isWritable: false });
+    }
+    out.push({ pubkey: usdcOracle, isSigner: false, isWritable: false });
+    out.push({ pubkey: solOracle, isSigner: false, isWritable: false });
+    return out;
+  };
+
+  /// The PAIR (Asset, token account) — redeem needs no oracle.
   const redeemAccounts = async (): Promise<AccountMeta[]> => {
     const vault = await vaultProgram.account.vault.fetch(vaultPda);
     const out: AccountMeta[] = [];
@@ -159,18 +189,19 @@ describe("execute_action — vault → adapter → dex", () => {
   };
 
   /**
-   * Account list mà VAULT gửi cho ADAPTER.
+   * The account list the VAULT sends to the ADAPTER.
    *
-   * Ba account đầu là của adapter (`Swap` struct), phần còn lại adapter chuyển tiếp
-   * xuống DEX. Vault không hiểu và không áp đặt thứ tự này — client dựng, vault
-   * forward nguyên vẹn, và chỉ ký cho đúng vault_authority.
+   * The first three accounts belong to the adapter (its `Swap` struct); the rest are
+   * forwarded by the adapter down to the DEX. The vault neither understands nor imposes
+   * this ordering — the client builds it, the vault forwards it verbatim, and only signs
+   * for exactly vault_authority.
    */
   const adapterAccounts = async (): Promise<AccountMeta[]> => [
-    // --- Swap struct của adapter ---
+    // --- the adapter's Swap struct ---
     { pubkey: vaultAuthority, isSigner: false, isWritable: false },
     { pubkey: await vaultTokenAccount(solMint), isSigner: false, isWritable: true },
     { pubkey: dexProgram.programId, isSigner: false, isWritable: false },
-    // --- remaining_accounts của adapter = account list của DEX ---
+    // --- the adapter's remaining_accounts = the DEX's account list ---
     { pubkey: vaultAuthority, isSigner: false, isWritable: false },
     { pubkey: await vaultTokenAccount(usdcMint), isSigner: false, isWritable: true },
     { pubkey: await vaultTokenAccount(solMint), isSigner: false, isWritable: true },
@@ -188,7 +219,7 @@ describe("execute_action — vault → adapter → dex", () => {
     return h.digest().subarray(0, 8);
   };
 
-  /// Payload cho mock_dex::swap(amount_in, amount_out).
+  /// Payload for mock_dex::swap(amount_in, amount_out).
   const dexPayload = (amountIn: bigint, amountOut: bigint): Buffer => {
     const buf = Buffer.alloc(16);
     buf.writeBigUInt64LE(amountIn, 0);
@@ -196,7 +227,7 @@ describe("execute_action — vault → adapter → dex", () => {
     return Buffer.concat([disc("swap"), buf]);
   };
 
-  /// Payload cho adapter_swap::swap(amount_in, min_out, dex_payload).
+  /// Payload for adapter_swap::swap(amount_in, min_out, dex_payload).
   const adapterPayload = (
     amountIn: bigint,
     minOut: bigint,
@@ -211,10 +242,10 @@ describe("execute_action — vault → adapter → dex", () => {
   };
 
   /**
-   * Gọi vault.execute_action.
+   * Call vault.execute_action.
    *
-   * `dexIn`/`dexOut` là những gì DEX THẬT SỰ làm — cho phép mock gian lận.
-   * `minOut` là những gì adapter YÊU CẦU.
+   * `dexIn`/`dexOut` are what the DEX ACTUALLY does — which is what lets the mock
+   * misbehave. `minOut` is what the adapter DEMANDS.
    */
   const doExecute = async (
     amountIn: bigint,
@@ -234,12 +265,13 @@ describe("execute_action — vault → adapter → dex", () => {
         adapter: adapterPda(adapterProgram.programId),
         adapterProgram: adapterProgram.programId,
         assetIn: assetPda(usdcMint),
+        assetOut: assetPda(solMint),
       })
-      .remainingAccounts([...(await navAccounts()), ...(await adapterAccounts())])
+      .remainingAccounts([...(await meterAccounts()), ...(await adapterAccounts())])
       .signers([admin])
       .rpc();
 
-  /// Swap "trung thực" theo giá Pyth: 1000 USDC ($1000) → 10 SOL ($100/SOL).
+  /// An "honest" swap at the Pyth price: 1000 USDC ($1000) → 10 SOL ($100/SOL).
   const fairOut = (usdcIn: bigint): bigint =>
     (usdcIn * BigInt(1e9) * BigInt(USDC_PRICE)) / BigInt(1e6) / BigInt(SOL_PRICE);
 
@@ -302,21 +334,21 @@ describe("execute_action — vault → adapter → dex", () => {
       [usdcMint, USDC_FEED, usdcOracle],
       [solMint, SOL_FEED, solOracle],
     ] as const) {
-      const vaultAta = Keypair.generate();
+      // Must be the canonical ATA of vault_authority — see tests/surfnet-jupiter.ts.
       await vaultProgram.methods
         .registerAsset(Array.from(feed), new BN(0))
         .accounts({
           admin: admin.publicKey,
           mint,
-          vaultTokenAccount: vaultAta.publicKey,
+          vaultTokenAccount: ata(mint, vaultAuthority),
           oracle,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
-        .signers([admin, vaultAta])
+        .signers([admin])
         .rpc();
     }
 
-    // Nạp 10k USDC vào vault.
+    // Deposit 10k USDC into the vault.
     const aliceUsdc = await createAta(provider, alice, usdcMint, alice.publicKey);
     await mintTo(provider, admin, usdcMint, aliceUsdc, 10_000_000_000n);
     const aliceShares = await createAta(
@@ -341,7 +373,7 @@ describe("execute_action — vault → adapter → dex", () => {
       .signers([alice])
       .rpc();
 
-    // Pool thanh khoản của DEX giả.
+    // The mock DEX's liquidity pool.
     [poolAuthority] = PublicKey.findProgramAddressSync(
       [Buffer.from("pool")],
       dexProgram.programId
@@ -350,9 +382,10 @@ describe("execute_action — vault → adapter → dex", () => {
     poolSol = await createAta(provider, admin, solMint, poolAuthority);
     await mintTo(provider, admin, solMint, poolSol, 1_000_000_000_000n);
 
-    // --- Đăng ký ADAPTER-SWAP (không phải DEX!) làm Action adapter ---
+    // --- Register ADAPTER-SWAP (not the DEX!) as the Action adapter ---
     //
-    // Vault CPI vào adapter, adapter CPI vào DEX. Vault không biết DEX nào tồn tại.
+    // The vault CPIs into the adapter, and the adapter CPIs into the DEX. The vault has
+    // no idea that any DEX exists.
     await vaultProgram.methods
       .registerAdapter(adapterProgram.programId, { action: {} }, "swap")
       .accounts({ admin: admin.publicKey })
@@ -361,7 +394,7 @@ describe("execute_action — vault → adapter → dex", () => {
 
     await advanceClock(BigInt(8 * 24 * 3600));
 
-    // is_entry = true: swap là cửa VÀO (mua asset mới) → pause chặn được.
+    // is_entry = true: a swap is an ENTRY (buying a new asset) → pause can block it.
     await vaultProgram.methods
       .registerCapability(ACTION_SWAP, true, PublicKey.default, new BN(0))
       .accounts({
@@ -379,14 +412,14 @@ describe("execute_action — vault → adapter → dex", () => {
 
   // -------------------------------------------------------------------------
 
-  it("swap thành công qua chuỗi vault → adapter → dex", async () => {
+  it("a swap succeeds through the vault → adapter → dex chain", async () => {
     const vaultUsdc = await vaultTokenAccount(usdcMint);
     const vaultSol = await vaultTokenAccount(solMint);
     const usdcBefore = await tokenBalance(provider, vaultUsdc);
     const solBefore = await tokenBalance(provider, vaultSol);
 
     const amountIn = 1_000_000_000n; // 1000 USDC
-    const out = fairOut(amountIn); // 10 SOL theo giá Pyth
+    const out = fairOut(amountIn); // 10 SOL at the Pyth price
 
     await doExecute(amountIn, out, amountIn, out);
 
@@ -394,12 +427,13 @@ describe("execute_action — vault → adapter → dex", () => {
     assert.equal(await tokenBalance(provider, vaultSol), solBefore + out);
   });
 
-  it("🛡 NAV-delta chặn adapter LẤY TIỀN KHÔNG TRẢ GÌ", async () => {
-    // DEX lấy 1000 USDC, trả về 0 SOL. Vault mất giá trị → NAV tụt → revert.
+  it("🛡 NAV-delta stops an adapter that TAKES THE MONEY AND RETURNS NOTHING", async () => {
+    // The DEX takes 1000 USDC and returns 0 SOL. The vault loses value → NAV drops →
+    // revert.
     //
-    // Điểm mấu chốt: vault KHÔNG cần biết đây là swap để bắt được. Nó chỉ thấy
-    // "giá trị của tôi giảm quá mức cho phép" — và đó là kiểm tra AGNOSTIC, đúng
-    // cho mọi action, kể cả những action chưa tồn tại.
+    // The key point: the vault does NOT need to know this is a swap in order to catch
+    // it. All it sees is "my value dropped more than allowed" — and that is an AGNOSTIC
+    // check, valid for every action, including actions that do not exist yet.
     const vaultUsdc = await vaultTokenAccount(usdcMint);
     const before = await tokenBalance(provider, vaultUsdc);
 
@@ -410,73 +444,76 @@ describe("execute_action — vault → adapter → dex", () => {
       rejected = true;
     }
 
-    assert.isTrue(rejected, "phải revert — vault mất giá trị");
+    assert.isTrue(rejected, "must revert — the vault lost value");
     assert.equal(
       await tokenBalance(provider, vaultUsdc),
       before,
-      "số dư KHÔNG đổi — transaction revert toàn bộ"
+      "the balance must NOT change — the whole transaction reverts"
     );
   });
 
-  it("🛡 NAV-delta chặn swap LỖ QUÁ SLIPPAGE (>1%)", async () => {
+  it("🛡 NAV-delta stops a swap that LOSES MORE THAN THE SLIPPAGE ALLOWANCE (>1%)", async () => {
     const vaultUsdc = await vaultTokenAccount(usdcMint);
     const before = await tokenBalance(provider, vaultUsdc);
 
     const amountIn = 1_000_000_000n;
     const fair = fairOut(amountIn);
-    const bad = (fair * 95n) / 100n; // chỉ trả 95% → lỗ 5%
+    const bad = (fair * 95n) / 100n; // only returns 95% → a 5% loss
 
     let rejected = false;
     try {
-      await doExecute(amountIn, 0n, amountIn, bad); // min_out = 0: adapter không chặn
+      await doExecute(amountIn, 0n, amountIn, bad); // min_out = 0: the adapter lets it through
     } catch {
       rejected = true;
     }
 
     assert.isTrue(
       rejected,
-      "phải revert vì ValueLost — dù ADAPTER cho qua (min_out = 0)"
+      "must revert with ValueLost — even though the ADAPTER allowed it (min_out = 0)"
     );
     assert.equal(await tokenBalance(provider, vaultUsdc), before);
   });
 
-  it("swap trong hạn slippage (<1%) vẫn qua", async () => {
+  it("a swap within the slippage allowance (<1%) still goes through", async () => {
     const vaultSol = await vaultTokenAccount(solMint);
     const before = await tokenBalance(provider, vaultSol);
 
     const amountIn = 1_000_000_000n;
     const fair = fairOut(amountIn);
-    const ok = (fair * 995n) / 1000n; // lỗ 0.5% — trong hạn 1%
+    const ok = (fair * 995n) / 1000n; // a 0.5% loss — within the 1% allowance
 
     await doExecute(amountIn, ok, amountIn, ok);
     assert.equal(await tokenBalance(provider, vaultSol), before + ok);
   });
 
-  it("🛡 adapter tự chặn khi DEX trả ít hơn min_out của nó", async () => {
-    // Lớp phòng thủ của ADAPTER (không phải vault). Nó thừa về mặt an toàn — vault
-    // sẽ bắt bằng NAV-delta — nhưng cho thông báo lỗi đúng chỗ.
+  it("🛡 the adapter blocks it itself when the DEX returns less than its min_out", async () => {
+    // The ADAPTER's defense layer (not the vault's). It is redundant from a safety
+    // standpoint — the vault would catch it via NAV-delta — but it produces the error
+    // message in the right place.
     const amountIn = 1_000_000_000n;
     const fair = fairOut(amountIn);
 
     let rejected = false;
     try {
-      // adapter đòi `fair`, DEX chỉ trả 90%.
+      // the adapter demands `fair`, the DEX only returns 90%.
       await doExecute(amountIn, fair, amountIn, (fair * 90n) / 100n);
     } catch {
       rejected = true;
     }
 
-    assert.isTrue(rejected, "adapter phải revert vì SlippageExceeded");
+    assert.isTrue(rejected, "the adapter must revert with SlippageExceeded");
   });
 
-  it("🔒 reserved: adapter KHÔNG tiêu được phần đã hứa cho người redeem", async () => {
-    // Lỗ hổng nghiêm trọng nhất từng có trong code này.
+  it("🔒 reserved: the adapter CANNOT spend what has been promised to redeemers", async () => {
+    // The most serious hole this code has ever had.
     //
-    // Kịch bản (trước khi có `reserved`):
-    //   1. Alice redeem_request → burn share, vault chốt "nợ Alice X USDC"
-    //   2. Alice chưa kịp claim (24 asset cần nhiều transaction)
-    //   3. execute swap đi TOÀN BỘ USDC — "hợp lệ" theo mọi kiểm tra khác
-    //   4. Alice claim → vault không còn đủ → FAIL. Share đã burn mất rồi.
+    // The scenario (before `reserved` existed):
+    //   1. Alice calls redeem_request → shares are burned, the vault locks in "we owe
+    //      Alice X USDC"
+    //   2. Alice has not claimed yet (24 assets take several transactions)
+    //   3. execute swaps away ALL of the USDC — "valid" according to every other check
+    //   4. Alice claims → the vault no longer has enough → FAIL. And her shares are
+    //      already burned.
 
     const vaultUsdc = await vaultTokenAccount(usdcMint);
     const usdcBalance = await tokenBalance(provider, vaultUsdc);
@@ -498,19 +535,19 @@ describe("execute_action — vault → adapter → dex", () => {
 
     const assetIn = await vaultProgram.account.asset.fetch(assetPda(usdcMint));
     const reserved = BigInt(assetIn.reserved.toString());
-    assert.isAbove(Number(reserved), 0, "redeem_request phải khoá phần đã hứa");
+    assert.isAbove(Number(reserved), 0, "redeem_request must lock the promised amount");
 
-    // Token vẫn còn NGUYÊN trong vault — chưa ai claim.
+    // The tokens are STILL fully in the vault — nobody has claimed yet.
     assert.equal(
       await tokenBalance(provider, vaultUsdc),
       usdcBalance,
-      "token chưa rời vault, chỉ mới bị khoá trên sổ sách"
+      "the tokens have not left the vault, they are only locked on the books"
     );
 
     const available = usdcBalance - reserved;
 
-    // ĐÒN TẤN CÔNG: cố swap nhiều hơn phần khả dụng.
-    // Số dư VẬT LÝ vẫn đủ — chỉ có `reserved` chặn.
+    // THE ATTACK: try to swap more than the available portion.
+    // The PHYSICAL balance is still enough — only `reserved` stops it.
     let rejected = false;
     try {
       const amt = available + 1n;
@@ -521,14 +558,15 @@ describe("execute_action — vault → adapter → dex", () => {
 
     assert.isTrue(
       rejected,
-      "phải revert vì InsufficientAvailableBalance — dù số dư vật lý đủ"
+      "must revert with InsufficientAvailableBalance — even though the physical balance is sufficient"
     );
 
-    // Nhưng swap trong phần khả dụng VẪN CHẠY — reserved không đóng băng vault.
+    // But a swap within the available portion STILL RUNS — reserved does not freeze the
+    // vault.
     const half = available / 2n;
     await doExecute(half, fairOut(half), half, fairOut(half));
 
-    // Và Alice VẪN claim được đúng phần của mình — đó là toàn bộ mục đích.
+    // And Alice can STILL claim exactly her share — which is the whole point.
     const aliceUsdc = ata(usdcMint, alice.publicKey);
     const beforeClaim = await tokenBalance(provider, aliceUsdc);
 
@@ -558,18 +596,18 @@ describe("execute_action — vault → adapter → dex", () => {
     assert.equal(
       await tokenBalance(provider, aliceUsdc),
       beforeClaim + reserved,
-      "Alice nhận đúng phần đã hứa — kể cả sau khi vault đã swap"
+      "Alice receives exactly what was promised — even after the vault has swapped"
     );
 
     const after = await vaultProgram.account.asset.fetch(assetPda(usdcMint));
     assert.equal(
       BigInt(after.reserved.toString()),
       0n,
-      "reserved về 0 sau claim — nếu không nó phình lên và khoá chết vault"
+      "reserved goes back to 0 after the claim — otherwise it grows unbounded and locks the vault dead"
     );
   });
 
-  it("🛡 pause chặn cửa VÀO (is_entry = true)", async () => {
+  it("🛡 pause blocks ENTRIES (is_entry = true)", async () => {
     await vaultProgram.methods
       .setPaused(true)
       .accounts({ admin: admin.publicKey })
@@ -584,10 +622,10 @@ describe("execute_action — vault → adapter → dex", () => {
       err = e.toString();
     }
 
-    // Vault không biết action 0 là "swap". Nó đọc cờ `is_entry` mà governance đã đặt
-    // lúc đăng ký capability — đó là cách nó biết đây là cửa vào mà không cần hiểu
-    // ngữ nghĩa.
-    assert.include(err, "VaultPaused", "cửa vào phải bị pause chặn");
+    // The vault does not know that action 0 is a "swap". It reads the `is_entry` flag
+    // that governance set when the capability was registered — that is how it knows this
+    // is an entry without understanding the semantics.
+    assert.include(err, "VaultPaused", "an entry must be blocked by pause");
 
     await vaultProgram.methods
       .setPaused(false)

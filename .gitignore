@@ -23,3 +23,6 @@ skills-lock.json
 
 .env
 .env.*
+
+# Surfpool local state cache — mainnet fork data, not source
+.surfpool/

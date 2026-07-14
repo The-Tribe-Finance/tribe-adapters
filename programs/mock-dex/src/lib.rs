@@ -1,33 +1,36 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("Dex1111111111111111111111111111111111111111");
+declare_id!("BeqpQDwTXfuSE3Q4kWCKJKYKYKC84sVPVYeGk4KkfxXo");
 
-/// # DEX giả — CHỈ dùng cho test
+/// # Mock DEX — for TESTS ONLY
 ///
-/// Đóng vai Jupiter trong test tích hợp. Nó tồn tại để trả lời một câu hỏi mà
-/// không test nào khác trả lời được:
+/// It plays the role of Jupiter in the integration tests. It exists to answer one
+/// question that no other test can answer:
 ///
-///   **Lớp "chỉ tin số dư" của vault có thật sự chặn được một adapter gian lận không?**
+///   **Does the vault's "trust only balances" layer actually stop an adapter that
+///   misbehaves?**
 ///
-/// Nên program này CỐ Ý làm được những việc xấu — tiêu quá phần được phép, trả về
-/// ít hơn cam kết, không trả gì cả. Vault phải bắt được tất cả.
+/// So this program DELIBERATELY has the ability to do bad things — spend more than
+/// it is allowed to, return less than it promised, return nothing at all. The vault
+/// must catch all of them.
 ///
-/// Layout account ở đây do CHÍNH NÓ quy định (giống Jupiter tự quy định layout của
-/// `shared_accounts_route`). Vault không áp đặt thứ tự — nó chỉ chuyển tiếp danh
-/// sách account mà client dựng, và chỉ ký cho đúng `vault_authority`.
+/// The account layout here is defined by THIS PROGRAM ITSELF (just as Jupiter defines
+/// the layout of `shared_accounts_route`). The vault does not impose an ordering — it
+/// simply forwards the account list the client built, and only signs for exactly
+/// `vault_authority`.
 #[program]
 pub mod mock_dex {
     use super::*;
 
-    /// Swap: lấy `amount_in` từ vault, trả `amount_out` về cho vault.
+    /// Swap: take `amount_in` from the vault, return `amount_out` back to the vault.
     ///
-    /// Cả hai con số đều do NGƯỜI GỌI truyền vào — đó chính là điểm mấu chốt.
-    /// Một DEX thật cũng vậy: vault không có cách nào biết nó sẽ làm gì trước khi
-    /// nó làm. Vault chỉ đo số dư sau đó.
+    /// Both numbers are supplied by the CALLER — and that is exactly the point.
+    /// A real DEX is no different: the vault has no way of knowing what it will do
+    /// before it does it. The vault only measures balances afterwards.
     pub fn swap(ctx: Context<Swap>, amount_in: u64, amount_out: u64) -> Result<()> {
-        // Lấy token từ vault. `vault_authority` ký cho việc này — chữ ký do vault
-        // cấp qua invoke_signed.
+        // Take tokens from the vault. `vault_authority` signs for this — the signature
+        // was granted by the vault via invoke_signed.
         if amount_in > 0 {
             token_interface::transfer_checked(
                 CpiContext::new(
@@ -44,7 +47,7 @@ pub mod mock_dex {
             )?;
         }
 
-        // Trả token về cho vault, ký bằng authority của pool.
+        // Return tokens to the vault, signing with the pool's authority.
         if amount_out > 0 {
             let bump = ctx.bumps.pool_authority;
             let seeds: &[&[u8]] = &[b"pool", &[bump]];
@@ -71,8 +74,9 @@ pub mod mock_dex {
 
 #[derive(Accounts)]
 pub struct Swap<'info> {
-    /// PDA của VAULT. Nó là signer — quyền lực này do vault cấp qua invoke_signed.
-    /// CHECK: mock, không đọc dữ liệu.
+    /// The VAULT's PDA. It is a signer — that power was granted by the vault via
+    /// invoke_signed.
+    /// CHECK: mock, no data is read.
     pub vault_authority: Signer<'info>,
 
     #[account(mut)]
@@ -80,7 +84,7 @@ pub struct Swap<'info> {
     #[account(mut)]
     pub vault_token_out: InterfaceAccount<'info, TokenAccount>,
 
-    /// CHECK: PDA giữ thanh khoản của pool giả.
+    /// CHECK: PDA holding the mock pool's liquidity.
     #[account(seeds = [b"pool"], bump)]
     pub pool_authority: UncheckedAccount<'info>,
 
