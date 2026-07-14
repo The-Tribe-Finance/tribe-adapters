@@ -4,7 +4,7 @@
 
 This code has **not been audited**. It is not suitable for real funds.
 
-`mock-dex` is a test fixture, designed to misbehave so that the vault's checks can be
+`test-adapter` is a test fixture, designed to misbehave so that the vault's checks can be
 shown to catch it. It is not a production program and must never be deployed.
 
 ## Adapter trust levels

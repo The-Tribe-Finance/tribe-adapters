@@ -1,36 +1,41 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("BeqpQDwTXfuSE3Q4kWCKJKYKYKC84sVPVYeGk4KkfxXo");
+declare_id!("E88wFPQJPYv7PoeV2JbwEw76u6oiRS4m2fZSqqhaG2JA");
 
-/// # Mock DEX — for TESTS ONLY
+/// # test-adapter — TESTS ONLY, never deployed to a live network
 ///
-/// It plays the role of Jupiter in the integration tests. It exists to answer one
-/// question that no other test can answer:
+/// A stand-in for a real Action adapter (Jupiter, Kamino…), built to answer the one
+/// question a real, well-behaved DEX never can:
 ///
-///   **Does the vault's "trust only balances" layer actually stop an adapter that
-///   misbehaves?**
+///   **Do the vault's guards actually stop an adapter that misbehaves?**
 ///
-/// So this program DELIBERATELY has the ability to do bad things — spend more than
-/// it is allowed to, return less than it promised, return nothing at all. The vault
-/// must catch all of them.
+/// Jupiter will not take your money and return nothing. It will not blow past the
+/// slippage allowance. It will not spend tokens reserved for a pending redemption. So a
+/// test that only ever runs a real, honest swap proves that the happy path works — and
+/// says nothing about security.
 ///
-/// The account layout here is defined by THIS PROGRAM ITSELF (just as Jupiter defines
-/// the layout of `shared_accounts_route`). The vault does not impose an ordering — it
-/// simply forwards the account list the client built, and only signs for exactly
-/// `vault_authority`.
+/// This program does all of those things *on command*. The caller supplies `amount_in`
+/// and `amount_out` directly, and the adapter simply moves those amounts. The vault, which
+/// measured balances before the CPI and measures them again after, has to catch every
+/// abuse and revert.
+///
+/// The account layout is defined by THIS program. The vault imposes no ordering — it
+/// forwards the account list the client built, and signs only for `vault_authority`.
 #[program]
-pub mod mock_dex {
+pub mod test_adapter {
     use super::*;
 
-    /// Swap: take `amount_in` from the vault, return `amount_out` back to the vault.
+    /// Move `amount_in` out of the vault and `amount_out` back in.
     ///
-    /// Both numbers are supplied by the CALLER — and that is exactly the point.
-    /// A real DEX is no different: the vault has no way of knowing what it will do
-    /// before it does it. The vault only measures balances afterwards.
+    /// Both numbers come from the CALLER — that is the whole point. The vault cannot know
+    /// what an adapter will do before it does it; it only trusts the balances afterwards.
+    /// Feeding these two numbers lets a test drive every abuse: `amount_out = 0` (took the
+    /// money, returned nothing), a value below the slippage allowance, or an `amount_in`
+    /// that dips into the reserved balance.
     pub fn swap(ctx: Context<Swap>, amount_in: u64, amount_out: u64) -> Result<()> {
-        // Take tokens from the vault. `vault_authority` signs for this — the signature
-        // was granted by the vault via invoke_signed.
+        // Pull tokens out of the vault. `vault_authority` signs — the signature was
+        // granted by the vault via invoke_signed.
         if amount_in > 0 {
             token_interface::transfer_checked(
                 CpiContext::new(
@@ -47,7 +52,7 @@ pub mod mock_dex {
             )?;
         }
 
-        // Return tokens to the vault, signing with the pool's authority.
+        // Return tokens to the vault, signing with the pool's own authority.
         if amount_out > 0 {
             let bump = ctx.bumps.pool_authority;
             let seeds: &[&[u8]] = &[b"pool", &[bump]];
@@ -74,7 +79,7 @@ pub mod mock_dex {
 
 #[derive(Accounts)]
 pub struct Swap<'info> {
-    /// The VAULT's PDA. It is a signer — that power was granted by the vault via
+    /// The VAULT's PDA. It is a signer — that authority was granted by the vault via
     /// invoke_signed.
     /// CHECK: mock, no data is read.
     pub vault_authority: Signer<'info>,

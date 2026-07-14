@@ -65,7 +65,7 @@ audited and locked down accordingly. The vault refuses to execute trades through
 | `adapter-swap` | Action | Working; exercised against Jupiter on a mainnet fork |
 | `adapter-lend` | Action | Planned |
 | `pricing-lst` | Pricing | Planned |
-| `mock-dex` | Test fixture | Never deployed |
+| `test-adapter` | Test fixture | Never deployed |
 
 ---
 
@@ -84,7 +84,7 @@ that are true of *any* action, and everything protocol-specific lives in the ada
 
 ```bash
 anchor build
-yarn test          # integration tests against a mock DEX (bankrun)
+yarn test          # integration tests against a test adapter (bankrun)
 ```
 
 Against the real Jupiter, on a mainnet fork:
@@ -99,7 +99,7 @@ This repository vendors `tribe-vault` for testing only — an adapter must prove
 *through* the vault, with every guard in place. The canonical source is
 [`tribe-vault`](https://github.com/The-Tribe-Finance/tribe-vault).
 
-`mock-dex` is a test fixture that can be instructed to misbehave, so that the vault's
+`test-adapter` is a test fixture that can be instructed to misbehave, so that the vault's
 checks can be shown to catch it.
 
 ---

@@ -1,12 +1,12 @@
 [package]
-name = "mock-dex"
+name = "test-adapter"
 version = "0.1.0"
 description = "DEX giả, CHỈ dùng cho test — đóng vai Jupiter để kiểm chứng lớp phòng thủ của vault"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "mock_dex"
+name = "test_adapter"
 
 [features]
 default = []

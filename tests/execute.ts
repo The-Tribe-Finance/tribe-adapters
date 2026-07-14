@@ -13,7 +13,7 @@ import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { assert } from "chai";
 
 import { TribeVault } from "../target/types/tribe_vault";
-import { MockDex } from "../target/types/mock_dex";
+import { TestAdapter } from "../target/types/test_adapter";
 import { AdapterSwap } from "../target/types/adapter_swap";
 import { createMint, createAta, mintTo, tokenBalance, ata } from "./spl";
 import {
@@ -40,15 +40,15 @@ const ACTION_SWAP = 0;
  *
  * The architecture's real CPI chain:
  *
- *     tribe-vault  ──►  adapter-swap  ──►  mock-dex
- *     (verifies)        (knows swaps)      (plays Jupiter)
+ *     tribe-vault  ──►  adapter-swap  ──►  test-adapter
+ *     (verifies)        (knows swaps)      (a fixture that plays Jupiter)
  *
  * The questions this file answers:
  *
  *   1. Can the vault verify the result WITHOUT understanding swaps?
  *   2. Does the NAV-delta layer stop an adapter that misbehaves?
  *
- * `mock-dex` is deliberately capable of doing bad things — spending more than it is
+ * `test-adapter` is deliberately capable of doing bad things — spending more than it is
  * allowed to, returning less than it promised, taking money and returning nothing.
  * Each test is one concrete attack.
  */
@@ -56,7 +56,7 @@ describe("execute_action — vault → adapter → dex", () => {
   let ctx: ProgramTestContext;
   let provider: BankrunProvider;
   let vaultProgram: Program<TribeVault>;
-  let dexProgram: Program<MockDex>;
+  let dexProgram: Program<TestAdapter>;
   let adapterProgram: Program<AdapterSwap>;
   let client: BanksClient;
 
@@ -219,7 +219,7 @@ describe("execute_action — vault → adapter → dex", () => {
     return h.digest().subarray(0, 8);
   };
 
-  /// Payload for mock_dex::swap(amount_in, amount_out).
+  /// Payload for test_adapter::swap(amount_in, amount_out).
   const dexPayload = (amountIn: bigint, amountOut: bigint): Buffer => {
     const buf = Buffer.alloc(16);
     buf.writeBigUInt64LE(amountIn, 0);
@@ -244,7 +244,7 @@ describe("execute_action — vault → adapter → dex", () => {
   /**
    * Call vault.execute_action.
    *
-   * `dexIn`/`dexOut` are what the DEX ACTUALLY does — which is what lets the mock
+   * `dexIn`/`dexOut` are what the DEX ACTUALLY does — which is what lets the fixture
    * misbehave. `minOut` is what the adapter DEMANDS.
    */
   const doExecute = async (
@@ -296,7 +296,7 @@ describe("execute_action — vault → adapter → dex", () => {
     provider = new BankrunProvider(ctx);
     anchor.setProvider(provider);
     vaultProgram = anchor.workspace.tribeVault as Program<TribeVault>;
-    dexProgram = anchor.workspace.mockDex as Program<MockDex>;
+    dexProgram = anchor.workspace.testAdapter as Program<TestAdapter>;
     adapterProgram = anchor.workspace.adapterSwap as Program<AdapterSwap>;
     client = ctx.banksClient;
     now = (await client.getClock()).unixTimestamp;
@@ -373,7 +373,7 @@ describe("execute_action — vault → adapter → dex", () => {
       .signers([alice])
       .rpc();
 
-    // The mock DEX's liquidity pool.
+    // The test adapter's liquidity pool.
     [poolAuthority] = PublicKey.findProgramAddressSync(
       [Buffer.from("pool")],
       dexProgram.programId

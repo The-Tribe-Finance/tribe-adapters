@@ -8,7 +8,7 @@ skip-lint = false
 [programs.localnet]
 adapter_swap = "3wQCqUNGMBZL3Pe1v1iyqvonKMNMHjgByEw7iBTGHwyN"
 tribe_vault = "ESRKS2xBKnuTZWU7qQip2koV7uG742ehB4qbojwtTrZs"
-mock_dex = "BeqpQDwTXfuSE3Q4kWCKJKYKYKC84sVPVYeGk4KkfxXo"
+test_adapter = "E88wFPQJPYv7PoeV2JbwEw76u6oiRS4m2fZSqqhaG2JA"
 
 [registry]
 url = "https://api.apr.dev"

@@ -4,7 +4,7 @@
  *     tribe-vault  ──►  adapter-swap  ──►  Jupiter (the real program)
  *     (verifies)        (knows swaps)      (real routes, real pools)
  *
- * This is the test that `mock-dex` cannot be: mock-dex is a program I wrote, with an
+ * This is the test that `test-adapter` cannot be: test-adapter is a fixture I wrote, with an
  * account layout I chose. It proves the vault's guards work, but it proves nothing about
  * whether the adapter actually fits Jupiter — I built both ends of that conversation.
  *
