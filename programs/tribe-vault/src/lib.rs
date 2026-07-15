@@ -19,7 +19,7 @@ use math::{pro_rata_amount, shares_for_deposit};
 use nav::{add_reserved, available_balances, compute_nav};
 use state::*;
 
-declare_id!("ESRKS2xBKnuTZWU7qQip2koV7uG742ehB4qbojwtTrZs");
+declare_id!("7JVBNNDs9uKgYYuJ3wPqdBSjtnNgV6s3pjxZ83QMmhVs");
 
 /// # The Tribe — Community Vault
 ///
@@ -114,6 +114,78 @@ pub mod tribe_vault {
         Ok(())
     }
 
+    /// Close a held position, freeing its slot so a different asset can be opened.
+    ///
+    /// A held slot is scarce (`MAX_ASSETS`). Once the vault has fully exited a
+    /// position — its token balance AND its reserved amount are both zero — the
+    /// slot serves no purpose and should be freed. This is the counterpart to
+    /// registering an asset; together they make the held set a small, revolving
+    /// window over a possibly huge whitelist.
+    ///
+    /// # Swap-remove keeps indices dense
+    ///
+    /// The asset being closed is at some index `k`. To avoid leaving a hole (which
+    /// would break every `for i in 0..asset_count` loop and the redeem bitmap),
+    /// the LAST held asset is moved into slot `k`: its `index` is rewritten to `k`
+    /// and `asset_mints[k]` is overwritten, then the vec is popped.
+    ///
+    /// This is safe for any outstanding redeem ticket: a ticket snapshots
+    /// `asset_mints` and `amounts` at burn time and claims against ITS OWN arrays
+    /// and bitmap — never the live vault index — so reordering vault slots cannot
+    /// corrupt it.
+    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+        // Never strand money: the position must be fully empty. The token account
+        // is read live (not trusted from any cached field), and `reserved` must be
+        // zero so we are not closing a slot still owed to a pending redeemer.
+        require!(
+            ctx.accounts.vault_token_account.amount == 0,
+            TribeError::AssetNotEmpty
+        );
+        require!(
+            ctx.accounts.asset.reserved == 0,
+            TribeError::AssetNotEmpty
+        );
+
+        let closing_index = ctx.accounts.asset.index;
+        let vault = &mut ctx.accounts.vault;
+        let last_index = vault
+            .asset_count
+            .checked_sub(1)
+            .ok_or(TribeError::InvalidVaultState)?;
+
+        require!(
+            (closing_index as usize) < vault.asset_mints.len(),
+            TribeError::AssetNotRegistered
+        );
+
+        if closing_index != last_index {
+            // Move the last asset into the freed slot. The caller must pass the
+            // last-index asset account so we can rewrite its stored index.
+            let moved = ctx
+                .accounts
+                .last_asset
+                .as_mut()
+                .ok_or(TribeError::MissingLastAsset)?;
+            require!(
+                moved.index == last_index,
+                TribeError::AssetNotRegistered
+            );
+            require_keys_eq!(
+                vault.asset_mints[last_index as usize],
+                moved.mint,
+                TribeError::AssetNotRegistered
+            );
+
+            moved.index = closing_index;
+            vault.asset_mints[closing_index as usize] = moved.mint;
+        }
+
+        vault.asset_mints.pop();
+        vault.asset_count = last_index;
+
+        Ok(())
+    }
+
     /// Turn pause on/off.
     ///
     /// Blocks deposits and ENTRY actions (buy/lend/stake). It does NOT block redeem,
@@ -146,6 +218,7 @@ pub mod tribe_vault {
     pub fn register_capability(
         ctx: Context<RegisterCapability>,
         action_id: ActionId,
+        mint: Pubkey,
         is_entry: bool,
         venue: Pubkey,
         max_notional: u64,
@@ -167,12 +240,8 @@ pub mod tribe_vault {
             TribeError::AdapterNotActive
         );
 
-        // The input asset must be registered in this exact vault.
-        require_keys_eq!(
-            ctx.accounts.asset.vault,
-            ctx.accounts.vault.key(),
-            TribeError::AssetNotRegistered
-        );
+        // The input asset is identified by `mint` alone — it need NOT be held yet.
+        // Whitelisting "may buy AAPLx" does not require the vault to already own AAPLx.
 
         // --- Life-or-death check: the receipt token MUST be visible to NAV ---
         //
@@ -219,7 +288,7 @@ pub mod tribe_vault {
         capability.adapter = adapter.program_id;
         capability.action_id = action_id;
         capability.is_entry = is_entry;
-        capability.mint = ctx.accounts.asset.mint;
+        capability.mint = mint;
         capability.venue = venue;
         capability.receipt_mint = receipt_mint;
         capability.max_notional = max_notional;
@@ -313,9 +382,10 @@ pub mod tribe_vault {
         ctx: Context<'_, '_, 'info, 'info, ExecuteAction<'info>>,
         action_id: ActionId,
         amount_in: u64,
+        out_feed_id: [u8; 32],
         payload: Vec<u8>,
     ) -> Result<()> {
-        execute::execute_action(ctx, action_id, amount_in, payload)
+        execute::execute_action(ctx, action_id, amount_in, out_feed_id, payload)
     }
 
     /// Enforce that every asset stays within its exposure cap.
@@ -805,6 +875,49 @@ pub struct RegisterAsset<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ClosePosition<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [VAULT_SEED],
+        bump = vault.bump,
+        has_one = admin @ TribeError::Unauthorized,
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+
+    /// The position being closed. Rent is refunded to the admin. Its seeds bind it
+    /// to this vault and mint, and `close` reclaims the account.
+    #[account(
+        mut,
+        close = admin,
+        seeds = [ASSET_SEED, vault.key().as_ref(), asset.mint.as_ref()],
+        bump = asset.bump,
+        constraint = asset.vault == vault.key() @ TribeError::AssetNotRegistered,
+    )]
+    pub asset: Box<Account<'info, Asset>>,
+
+    /// The vault's token account for this asset — read to prove the balance is 0.
+    #[account(
+        address = asset.token_account @ TribeError::AssetNotRegistered,
+    )]
+    pub vault_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The asset currently at the LAST index. Required only when the asset being
+    /// closed is not itself the last one — it gets moved into the freed slot, so
+    /// its stored index must be rewritten. Optional so closing the last asset
+    /// needs no extra account.
+    #[account(
+        mut,
+        seeds = [ASSET_SEED, vault.key().as_ref(), last_asset.mint.as_ref()],
+        bump = last_asset.bump,
+        constraint = last_asset.vault == vault.key() @ TribeError::AssetNotRegistered,
+    )]
+    pub last_asset: Option<Box<Account<'info, Asset>>>,
+}
+
+#[derive(Accounts)]
 pub struct AdminOnly<'info> {
     pub admin: Signer<'info>,
 
@@ -818,7 +931,7 @@ pub struct AdminOnly<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(action_id: ActionId)]
+#[instruction(action_id: ActionId, mint: Pubkey)]
 pub struct RegisterCapability<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -837,16 +950,17 @@ pub struct RegisterCapability<'info> {
     )]
     pub adapter: Box<Account<'info, Adapter>>,
 
-    /// The input asset of this action.
-    #[account(
-        seeds = [ASSET_SEED, vault.key().as_ref(), asset.mint.as_ref()],
-        bump = asset.bump,
-    )]
-    pub asset: Box<Account<'info, Asset>>,
+    // NOTE: the input asset is identified by the `mint` PARAMETER, not by a
+    // pre-existing Asset account. A capability is the WHITELIST — permission to
+    // trade a mint — and must be registrable for thousands of mints the vault
+    // does not (yet) hold. The Asset (held slot) is opened later, when the vault
+    // first acquires the position. See DESIGN-WHITELIST-VS-HELD.md.
 
     /// The Asset of the receipt token (kToken, LST). It MUST be present when the action is
-    /// Lend or Stake. See `Capability::receipt_mint` — without it, NAV goes blind and the
-    /// vault is diluted by exactly the amount taken out to lend.
+    /// Lend or Stake. A receipt token is a HELD position by nature (it must be priced by a
+    /// pricing adapter), so its Asset slot must already exist — unlike the input mint.
+    /// See `Capability::receipt_mint` — without it, NAV goes blind and the vault is diluted
+    /// by exactly the amount taken out to lend.
     #[account(
         seeds = [ASSET_SEED, vault.key().as_ref(), receipt_asset.mint.as_ref()],
         bump = receipt_asset.bump,
@@ -862,7 +976,7 @@ pub struct RegisterCapability<'info> {
             vault.key().as_ref(),
             adapter.program_id.as_ref(),
             &[action_id],
-            asset.mint.as_ref(),
+            mint.as_ref(),
         ],
         bump
     )]

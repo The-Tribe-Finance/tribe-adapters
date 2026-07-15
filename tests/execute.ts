@@ -257,6 +257,7 @@ describe("execute_action — vault → adapter → dex", () => {
       .executeAction(
         ACTION_SWAP,
         new BN(amountIn.toString()),
+        Array.from(SOL_FEED),
         adapterPayload(amountIn, minOut, dexPayload(dexIn, dexOut))
       )
       .accounts({
@@ -266,6 +267,10 @@ describe("execute_action — vault → adapter → dex", () => {
         adapterProgram: adapterProgram.programId,
         assetIn: assetPda(usdcMint),
         assetOut: assetPda(solMint),
+        outMint: solMint,
+        vaultOutTokenAccount: ata(solMint, vaultAuthority),
+        outOracle: solOracle,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .remainingAccounts([...(await meterAccounts()), ...(await adapterAccounts())])
       .signers([admin])
@@ -396,11 +401,10 @@ describe("execute_action — vault → adapter → dex", () => {
 
     // is_entry = true: a swap is an ENTRY (buying a new asset) → pause can block it.
     await vaultProgram.methods
-      .registerCapability(ACTION_SWAP, true, PublicKey.default, new BN(0))
+      .registerCapability(ACTION_SWAP, usdcMint, true, PublicKey.default, new BN(0))
       .accounts({
         admin: admin.publicKey,
         adapter: adapterPda(adapterProgram.programId),
-        asset: assetPda(usdcMint),
         receiptAsset: null,
         capability: capabilityPda(adapterProgram.programId, ACTION_SWAP, usdcMint),
       })

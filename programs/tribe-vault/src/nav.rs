@@ -170,6 +170,24 @@ pub fn available_balances<'info>(
     vault_key: &Pubkey,
     remaining: &'info [AccountInfo<'info>],
 ) -> Result<[u64; MAX_ASSETS]> {
+    available_balances_with_fresh(vault, vault_key, remaining, None)
+}
+
+/// Like `available_balances`, but tolerates ONE asset whose `Asset` account data has
+/// not been flushed yet (a slot just opened by `execute_action` via `init_if_needed`).
+///
+/// For that `fresh` index the on-account fields are still zeroed (Anchor serializes
+/// `Account<T>` only at instruction exit), so re-reading it with `Account::try_from`
+/// would see a mint/index that do not match the vault's in-memory `asset_mints`. The
+/// caller has ALREADY fully validated that asset via the named `asset_out` account, so
+/// here we skip the redundant re-validation and read only its token balance. A fresh
+/// slot has `reserved == 0` by construction, so nothing is owed against it.
+pub fn available_balances_with_fresh<'info>(
+    vault: &Vault,
+    vault_key: &Pubkey,
+    remaining: &'info [AccountInfo<'info>],
+    fresh: Option<(usize, &Pubkey)>,
+) -> Result<[u64; MAX_ASSETS]> {
     let asset_count = vault.asset_count as usize;
 
     let mut balances = [0u64; MAX_ASSETS];
@@ -187,6 +205,24 @@ pub fn available_balances<'info>(
     for i in 0..asset_count {
         let asset_info: &AccountInfo<'info> = &remaining[i * 2];
         let token_info: &AccountInfo<'info> = &remaining[i * 2 + 1];
+
+        // The one just-opened slot: its account data is not flushed yet, so trust the
+        // caller's validation and read only the balance. We still bind the token
+        // account to the vault's expected ATA (passed by the caller) so a wrong token
+        // account cannot be slipped in.
+        if let Some((fresh_i, fresh_token_account)) = fresh {
+            if i == fresh_i {
+                require_keys_eq!(
+                    *token_info.key,
+                    *fresh_token_account,
+                    TribeError::AssetNotRegistered
+                );
+                let token_account: InterfaceAccount<TokenAccount> =
+                    InterfaceAccount::try_from(token_info)?;
+                balances[i] = token_account.amount; // reserved == 0 for a fresh slot
+                continue;
+            }
+        }
 
         // Account<T> checks owner + discriminator — never UncheckedAccount, or an
         // attacker forges a look-alike account and overstates the balance.
@@ -251,7 +287,18 @@ pub fn value_of<'info>(
 
     // Only what the vault ACTUALLY still owns — minus what is promised to redeemers.
     let balance = token_account.amount.saturating_sub(asset.reserved);
+    value_from_balance(asset, balance, oracle_info, clock)
+}
 
+/// Price a KNOWN balance of `asset` using its oracle. Split out of `value_of` so a
+/// caller that already holds the balance (e.g. from a named `InterfaceAccount` whose
+/// AccountInfo it cannot lend at `'info`) can still get the value.
+pub fn value_from_balance<'info>(
+    asset: &Asset,
+    balance: u64,
+    oracle_info: &'info AccountInfo<'info>,
+    clock: &Clock,
+) -> Result<(u64, u64)> {
     let value = match asset.kind {
         AssetKind::SplToken => {
             require_keys_eq!(

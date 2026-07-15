@@ -32,6 +32,10 @@ pub enum TribeError {
     TooManyAssets,
     #[msg("Asset still holds a balance and cannot be removed")]
     AssetNotEmpty,
+    #[msg("Closing a non-last position requires the last asset account")]
+    MissingLastAsset,
+    #[msg("Vault is already holding the maximum number of positions")]
+    TooManyPositions,
     #[msg("Asset is disabled")]
     AssetDisabled,
 

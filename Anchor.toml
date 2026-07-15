@@ -6,9 +6,9 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-adapter_swap = "3wQCqUNGMBZL3Pe1v1iyqvonKMNMHjgByEw7iBTGHwyN"
-tribe_vault = "ESRKS2xBKnuTZWU7qQip2koV7uG742ehB4qbojwtTrZs"
+tribe_vault = "7JVBNNDs9uKgYYuJ3wPqdBSjtnNgV6s3pjxZ83QMmhVs"
 test_adapter = "E88wFPQJPYv7PoeV2JbwEw76u6oiRS4m2fZSqqhaG2JA"
+adapter_swap = "3wQCqUNGMBZL3Pe1v1iyqvonKMNMHjgByEw7iBTGHwyN"
 
 [registry]
 url = "https://api.apr.dev"
@@ -18,4 +18,4 @@ cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/execute.ts"
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/vault.ts && yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/execute.ts"

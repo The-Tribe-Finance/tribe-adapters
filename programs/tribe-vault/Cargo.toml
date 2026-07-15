@@ -18,7 +18,10 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 
 [dependencies]
-anchor-lang = "0.31.1"
+# init_if_needed lets execute_action open a held-position slot the first time the
+# vault buys a token. Re-init is guarded explicitly (see execute_action): a fresh
+# Asset is populated once, an existing one is fully re-validated.
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
 anchor-spl = "0.31.1"
 pyth-solana-receiver-sdk = "0.6.1"
 

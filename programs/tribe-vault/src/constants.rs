@@ -30,7 +30,7 @@ pub const ADAPTER_TIMELOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const CAPABILITY_TIMELOCK_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 /// Maximum number of assets the vault can hold.
-pub const MAX_ASSETS: usize = 24;
+pub const MAX_ASSETS: usize = 40;
 
 /// A Pyth price older than this (seconds) is rejected.
 pub const MAX_PRICE_AGE_SECONDS: u64 = 60;

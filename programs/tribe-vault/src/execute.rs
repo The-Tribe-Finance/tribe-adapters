@@ -3,11 +3,13 @@ use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
     program::invoke_signed,
 };
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 
 use crate::constants::*;
 use crate::errors::TribeError;
-use crate::nav::{available_balances, compute_nav, value_of};
-use crate::state::{ActionId, Adapter, AdapterKind, Asset, Capability, Vault};
+use crate::nav::{available_balances, available_balances_with_fresh, compute_nav, value_from_balance, value_of};
+use crate::state::{ActionId, Adapter, AdapterKind, AssetKind, Asset, Capability, Vault};
 
 /// # execute_action — where money leaves the vault
 ///
@@ -84,6 +86,9 @@ pub fn execute_action<'info>(
     ctx: Context<'_, '_, 'info, 'info, ExecuteAction<'info>>,
     action_id: ActionId,
     amount_in: u64,
+    // Pyth feed id for the received asset — used ONLY when lazily opening a fresh
+    // slot, to bind its oracle. Ignored for an already-held asset (which has its own).
+    out_feed_id: [u8; 32],
     payload: Vec<u8>,
 ) -> Result<()> {
     require!(amount_in > 0, TribeError::ZeroAmount);
@@ -163,6 +168,71 @@ pub fn execute_action<'info>(
         );
     }
 
+    // --- Lazy-open the received-asset slot (guarded re-init) ---
+    //
+    // `asset_out` is `init_if_needed`. Two cases, distinguished by whether its `vault`
+    // field is still zero (a brand-new account) or already set (a held position):
+    //
+    //   FRESH  -> populate it as a new held slot: assign the next index, push the mint,
+    //             bump asset_count. This is the ONLY place a slot is opened, so the
+    //             held-set stays under governance's control (execute is executor-gated).
+    //   EXISTS -> leave it; just re-validate below like any held asset.
+    //
+    // The guard is what makes init_if_needed safe here: a re-init cannot overwrite an
+    // existing slot's accounting, because we only write the fields when vault == default.
+    // Index of a slot opened THIS instruction, if any — its Asset account data is not
+    // flushed yet, so the balance meter must read it specially (see nav.rs).
+    let mut fresh_index: Option<usize> = None;
+    {
+        let out = &mut ctx.accounts.asset_out;
+        if out.vault == Pubkey::default() {
+            // A fresh position must be an ordinary SPL token — it is priced by an oracle.
+            // Receipt positions (lend/stake) are opened by register_asset with a pricing
+            // adapter, never lazily here.
+            let held = ctx.accounts.vault.asset_count as usize;
+            require!(held < MAX_ASSETS, TribeError::TooManyPositions);
+
+            out.vault = vault_key;
+            out.mint = ctx.accounts.out_mint.key();
+            out.token_account = ctx.accounts.vault_out_token_account.key();
+            out.kind = AssetKind::SplToken;
+            out.oracle = ctx.accounts.out_oracle.key();
+            out.feed_id = out_feed_id;
+            out.pricing_adapter = Pubkey::default();
+            out.decimals = ctx.accounts.out_mint.decimals;
+            out.index = ctx.accounts.vault.asset_count;
+            out.enabled = true;
+            out.max_exposure_bps = 0;
+            out.reserved = 0;
+            out.bump = ctx.bumps.asset_out;
+
+            fresh_index = Some(ctx.accounts.vault.asset_count as usize);
+
+            let vault = &mut ctx.accounts.vault;
+            vault.asset_mints.push(ctx.accounts.out_mint.key());
+            vault.asset_count = vault
+                .asset_count
+                .checked_add(1)
+                .ok_or(TribeError::MathOverflow)?;
+
+        } else {
+            // Existing slot: it must belong to this vault and be enabled (buying INTO a
+            // disabled asset is blocked; selling OUT is not, but that path uses a
+            // different asset as asset_out).
+            require_keys_eq!(out.vault, vault_key, TribeError::AssetNotRegistered);
+            require!(out.enabled, TribeError::AssetDisabled);
+            require_keys_eq!(
+                out.mint,
+                ctx.accounts.out_mint.key(),
+                TribeError::AssetNotRegistered
+            );
+        }
+    }
+
+    // The vault's ATA for the received asset — used to bind the fresh slot's balance
+    // read (its Asset account data is not flushed yet, so we cannot read it from there).
+    let out_token_account_key = ctx.accounts.vault_out_token_account.key();
+
     // --- Split remaining_accounts into THREE regions ---
     //
     // [0, 2N)      -> the (Asset, token account) pair for EVERY asset. BALANCE measurement — cheap.
@@ -206,7 +276,12 @@ pub fn execute_action<'info>(
     // --- BALANCES BEFORE: all assets (cheap) ---
     //
     // This is what catches an adapter touching an asset it never declared.
-    let bal_before = available_balances(&ctx.accounts.vault, &vault_key, bal_accounts)?;
+    let bal_before = available_balances_with_fresh(
+        &ctx.accounts.vault,
+        &vault_key,
+        bal_accounts,
+        fresh_index.map(|i| (i, &out_token_account_key)),
+    )?;
 
     // --- VALUES BEFORE: only the two assets involved (expensive) ---
 
@@ -224,12 +299,21 @@ pub fn execute_action<'info>(
         oracle_in,
         &clock,
     )?;
-    let (_, val_out_before) = value_of(
-        &ctx.accounts.asset_out,
-        &bal_accounts[idx_out * 2 + 1],
-        oracle_out,
-        &clock,
-    )?;
+    // A freshly-opened slot is empty (balance 0), and its token account did not exist
+    // before this instruction — so there is nothing to read, and its value-before is 0.
+    // Reading `bal_accounts[idx_out*2+1]` here would hit the not-yet-created ATA (a
+    // system-owned empty account) and fail the TokenAccount deserialize.
+    let val_out_before = if fresh_index == Some(idx_out) {
+        0u64
+    } else {
+        value_of(
+            &ctx.accounts.asset_out,
+            &bal_accounts[idx_out * 2 + 1],
+            oracle_out,
+            &clock,
+        )?
+        .1
+    };
 
     // --- The adapter may only spend the AVAILABLE portion ---
     //
@@ -334,7 +418,12 @@ pub fn execute_action<'info>(
     // =====================================================================
 
     // --- BALANCES AFTER: all assets (cheap) ---
-    let bal_after = available_balances(&ctx.accounts.vault, &vault_key, bal_accounts)?;
+    let bal_after = available_balances_with_fresh(
+        &ctx.accounts.vault,
+        &vault_key,
+        bal_accounts,
+        fresh_index.map(|i| (i, &out_token_account_key)),
+    )?;
 
     // (1) The adapter must NOT touch any asset other than the two it declared.
     //
@@ -370,12 +459,26 @@ pub fn execute_action<'info>(
         oracle_in,
         &clock,
     )?;
-    let (_, val_out_after) = value_of(
-        &ctx.accounts.asset_out,
-        &bal_accounts[idx_out * 2 + 1],
-        oracle_out,
-        &clock,
-    )?;
+    // For a freshly-opened asset, read the received balance from the named
+    // `vault_out_token_account` (Anchor keeps it current). Its `bal_accounts` snapshot
+    // can be stale because the ATA was created by init_if_needed during this same
+    // instruction. For an already-held asset, the snapshot is fine.
+    let val_out_after = if fresh_index == Some(idx_out) {
+        // The cached `.amount` was loaded at account resolution (before the CPI), so it
+        // is stale after the swap paid tokens in — reload it from the live account data.
+        ctx.accounts.vault_out_token_account.reload()?;
+        // reserved == 0 for a fresh slot, so the full balance counts.
+        let bal = ctx.accounts.vault_out_token_account.amount;
+        value_from_balance(&ctx.accounts.asset_out, bal, oracle_out, &clock)?.1
+    } else {
+        value_of(
+            &ctx.accounts.asset_out,
+            &bal_accounts[idx_out * 2 + 1],
+            oracle_out,
+            &clock,
+        )?
+        .1
+    };
 
     // (3) The trade must not lose more than `max_slippage` OF THE VALUE IT PUT IN.
     //
@@ -432,16 +535,22 @@ pub fn execute_action<'info>(
     // handed the vault's signing authority is exactly the thing we refuse to assume good
     // behavior from.
     for idx in [idx_in, idx_out] {
-        let asset: Account<Asset> = Account::try_from(&bal_accounts[idx * 2])?;
-        let token: anchor_spl::token_interface::TokenAccount =
-            anchor_spl::token_interface::TokenAccount::try_deserialize(
-                &mut &bal_accounts[idx * 2 + 1].try_borrow_data()?[..],
-            )?;
+        // A freshly-opened slot has reserved == 0 (nothing was ever promised against a
+        // position that did not exist a moment ago), and its Asset-PDA meter slot is a
+        // placeholder — so read its raw balance from the named account and use 0 reserved.
+        let (raw_balance, reserved) = if fresh_index == Some(idx) {
+            ctx.accounts.vault_out_token_account.reload()?;
+            (ctx.accounts.vault_out_token_account.amount, 0u64)
+        } else {
+            let asset: Account<Asset> = Account::try_from(&bal_accounts[idx * 2])?;
+            let token: anchor_spl::token_interface::TokenAccount =
+                anchor_spl::token_interface::TokenAccount::try_deserialize(
+                    &mut &bal_accounts[idx * 2 + 1].try_borrow_data()?[..],
+                )?;
+            (token.amount, asset.reserved)
+        };
 
-        require!(
-            token.amount >= asset.reserved,
-            TribeError::ReservedViolated
-        );
+        require!(raw_balance >= reserved, TribeError::ReservedViolated);
     }
 
     // --- Exposure cap: it CANNOT be checked here, and that is a deliberate trade-off ---
@@ -583,10 +692,12 @@ pub struct ExecuteAction<'info> {
     ///
     /// MVP: executor = admin. Later: a governance PDA, and from then on "allowed to
     /// execute" means "the proposal passed + the timelock elapsed". Exactly one place to
-    /// change.
+    /// change. Mutable because it pays rent when a fresh held-slot is opened.
+    #[account(mut)]
     pub authority: Signer<'info>,
 
     #[account(
+        mut, // lazy-open writes asset_mints/asset_count when buying a never-held token
         seeds = [VAULT_SEED],
         bump = vault.bump,
         constraint = vault.executor == authority.key() @ TribeError::Unauthorized,
@@ -643,15 +754,40 @@ pub struct ExecuteAction<'info> {
     /// The vault needs to know this one in order to PRICE it (expensive, which is why we
     /// only do it for 2 assets). Every other asset only gets its BALANCE checked (cheap)
     /// — enough to catch an adapter secretly touching them.
+    ///
+    /// `init_if_needed`: the FIRST time the vault buys a token, this opens a held-slot
+    /// for it. Re-init is guarded in the function body — a fresh Asset (vault field
+    /// still zero) is populated once and registered as a slot; an existing one is used
+    /// as-is. `out_mint` and `out_oracle` are needed to populate a fresh slot.
     #[account(
-        seeds = [ASSET_SEED, vault.key().as_ref(), asset_out.mint.as_ref()],
-        bump = asset_out.bump,
-        constraint = asset_out.vault == vault.key() @ TribeError::AssetNotRegistered,
-        // This only blocks BUYING INTO a disabled asset. Selling it OUT must remain
-        // possible, otherwise a broken asset would be stuck in the vault forever.
-        constraint = asset_out.enabled @ TribeError::AssetDisabled,
+        init_if_needed,
+        payer = authority,
+        space = 8 + Asset::INIT_SPACE,
+        seeds = [ASSET_SEED, vault.key().as_ref(), out_mint.key().as_ref()],
+        bump,
     )]
     pub asset_out: Box<Account<'info, Asset>>,
+
+    /// Mint of the received asset. Named (not derived from `asset_out`) because on a
+    /// fresh init `asset_out.mint` is still zero.
+    pub out_mint: Box<InterfaceAccount<'info, Mint>>,
+
+    /// The vault's ATA for the received asset — created on a fresh open. Must be the
+    /// canonical ATA of vault_authority (every DEX derives this address).
+    #[account(
+        init_if_needed,
+        payer = authority,
+        associated_token::mint = out_mint,
+        associated_token::authority = vault_authority,
+    )]
+    pub vault_out_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// CHECK: Pyth price update for the received asset; validated on read.
+    pub out_oracle: UncheckedAccount<'info>,
+
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
 }
 
 /// Register an adapter. Governance vote + a 7-day timelock.

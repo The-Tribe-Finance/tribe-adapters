@@ -385,7 +385,8 @@ pub struct RedeemTicket {
 
     /// Bitmap: bit i set means asset i has been claimed.
     /// This is what blocks double-claims — the single most important guard in redemption.
-    pub claimed_mask: u32,
+    /// u64 so it covers up to 64 assets (MAX_ASSETS is 40).
+    pub claimed_mask: u64,
     /// Assets still owed. Once zero, the ticket can be closed.
     pub remaining_count: u8,
 
@@ -395,10 +396,10 @@ pub struct RedeemTicket {
 
 impl RedeemTicket {
     pub fn is_claimed(&self, index: u8) -> bool {
-        self.claimed_mask & (1u32 << index) != 0
+        self.claimed_mask & (1u64 << index) != 0
     }
 
     pub fn mark_claimed(&mut self, index: u8) {
-        self.claimed_mask |= 1u32 << index;
+        self.claimed_mask |= 1u64 << index;
     }
 }

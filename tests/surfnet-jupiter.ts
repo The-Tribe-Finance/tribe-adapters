@@ -384,11 +384,10 @@ describe("execute_action → REAL Jupiter (surfnet mainnet fork)", function () {
     const capPda = capabilityPda(adapterProgram.programId, ACTION_SWAP, USDC);
     if (!(await connection.getAccountInfo(capPda))) {
       await vaultProgram.methods
-        .registerCapability(ACTION_SWAP, true, PublicKey.default, new BN(0))
+        .registerCapability(ACTION_SWAP, USDC, true, PublicKey.default, new BN(0))
         .accounts({
           admin: payer.publicKey,
           adapter: adapterPda(adapterProgram.programId),
-          asset: assetPda(USDC),
           receiptAsset: null,
           capability: capPda,
         })
